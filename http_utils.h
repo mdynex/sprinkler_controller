@@ -1,6 +1,19 @@
 #pragma once
 #include <WiFi.h>
 
+// =============================================================================
+// http_utils.h — Minimal HTTP/1.1 request parser and response sender
+//
+// The Arduino WiFiServer gives us raw TCP connections. This file handles the
+// HTTP layer: reading the request line and headers from the client, reading
+// any POST/PUT body, and writing a well-formed HTTP response back.
+//
+// Only the fields the API actually needs are extracted:
+//   method  — "GET", "POST", "PUT", or "DELETE"
+//   path    — the URL path, e.g. "/zones/1/on"
+//   body    — raw request body (for POST/PUT JSON payloads)
+// =============================================================================
+
 struct HttpRequest {
   String method;
   String path;
@@ -8,7 +21,8 @@ struct HttpRequest {
   int    contentLength;
 };
 
-// Reads the full HTTP request: first line, headers, and optional body.
+// Read a full HTTP request from the connected client.
+// Times out after 2 seconds to avoid hanging on slow or dropped connections.
 HttpRequest readRequest(WiFiClient& client) {
   HttpRequest req;
   req.contentLength = 0;
@@ -23,7 +37,7 @@ HttpRequest readRequest(WiFiClient& client) {
 
     if (c == '\n') {
       if (firstLine) {
-        // "GET /zones HTTP/1.1"
+        // First line is "METHOD /path HTTP/1.1" — parse method and path
         int s1 = line.indexOf(' ');
         int s2 = line.indexOf(' ', s1 + 1);
         if (s1 > 0 && s2 > s1) {
@@ -32,11 +46,12 @@ HttpRequest readRequest(WiFiClient& client) {
         }
         firstLine = false;
       } else {
+        // Subsequent lines are headers — look for Content-Length
         String lower = line;
         lower.toLowerCase();
         if (lower.startsWith("content-length:"))
           req.contentLength = line.substring(line.indexOf(':') + 1).toInt();
-        // Blank line signals end of headers
+        // An empty line marks the end of headers
         if (line == "" || line == "\r") break;
       }
       line = "";
@@ -45,7 +60,7 @@ HttpRequest readRequest(WiFiClient& client) {
     }
   }
 
-  // Read body (POST/PUT payloads)
+  // Read the request body if Content-Length was set (POST/PUT with JSON)
   if (req.contentLength > 0) {
     deadline = millis() + 1500;
     while ((int)req.body.length() < req.contentLength && millis() < deadline) {
@@ -56,6 +71,7 @@ HttpRequest readRequest(WiFiClient& client) {
   return req;
 }
 
+// Send an HTTP/1.1 JSON response back to the client.
 void sendResponse(WiFiClient& client, int status, const String& body) {
   const char* text = (status == 200) ? "OK" :
                      (status == 201) ? "Created" :
@@ -70,6 +86,6 @@ void sendResponse(WiFiClient& client, int status, const String& body) {
   client.print("Content-Length: ");
   client.println(body.length());
   client.println("Connection: close");
-  client.println();
+  client.println();   // blank line separates headers from body
   client.print(body);
 }
