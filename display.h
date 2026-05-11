@@ -150,6 +150,20 @@ void _drawHeader(const char* title) {
   }
 }
 
+// Redraws only the clock region in the header — avoids a full screen redraw
+// when the minute ticks over.
+void _updateClockDisplay() {
+  // Erase the right side of the header where the clock lives
+  gfx.fillRect(SCR_W - 90, 0, 90, HDR_H, C_BLACK);
+  if (ntpReady) {
+    String t = ntpFormattedTime().substring(0, 5);
+    gfx.setTextColor(C_WHITE);
+    gfx.setTextSize(2);
+    gfx.setCursor(SCR_W - 15 - (int)t.length() * 12, 17);
+    gfx.print(t);
+  }
+}
+
 void _drawStatusBar() {
   gfx.fillRect(0, STS_Y, SCR_W, STS_H, C_BLACK);
   gfx.setTextColor(C_DIM);
@@ -216,12 +230,13 @@ void _handleHomeTouch(int tx, int ty) {
     int y = HDR_H  + ZN_PAD + (i / ZN_COLS) * (ZN_H + ZN_PAD);
     if (_inRect(tx, ty, x, y, ZN_W, ZN_H)) {
       setZone(i, !zoneState[i]);
-      needsRedraw = true;
+      _drawZoneBtn(i);       // redraw just this button
+      _drawStatusBar();
       return;
     }
   }
-  if (_inRect(tx, ty, 20, NAV_Y + 10, 230, 50))        { currentScreen = SCR_SCHEDULES; needsRedraw = true; }
-  if (_inRect(tx, ty, SCR_W - 250, NAV_Y + 10, 230, 50)) { stopSchedule(); needsRedraw = true; }
+  if (_inRect(tx, ty, 20, NAV_Y + 10, 230, 50))          { currentScreen = SCR_SCHEDULES; needsRedraw = true; return; }
+  if (_inRect(tx, ty, SCR_W - 250, NAV_Y + 10, 230, 50)) { stopSchedule(); _drawStatusBar(); }
 }
 
 // ── SCHEDULES screen ───────────────────────────────────────────────────────
@@ -286,21 +301,34 @@ void _drawSchedulesScreen() {
 }
 
 void _handleSchedulesTouch(int tx, int ty) {
-  if (_inRect(tx, ty, 20, NAV_Y + 10, 160, 50))        { currentScreen = SCR_HOME; needsRedraw = true; return; }
-  if (_inRect(tx, ty, SCR_W - 250, NAV_Y + 10, 230, 50)) { stopSchedule(); needsRedraw = true; return; }
+  if (_inRect(tx, ty, 20, NAV_Y + 10, 160, 50))          { currentScreen = SCR_HOME; needsRedraw = true; return; }
+  if (_inRect(tx, ty, SCR_W - 250, NAV_Y + 10, 230, 50)) {
+    // Stop the running schedule; redraw only the row that changed + status bar
+    int prevIdx = runState.scheduleIndex;
+    stopSchedule();
+    int row = 0;
+    for (int i = 0; i < MAX_SCHEDULES && row < 5; i++) {
+      if (!schedules[i].used) continue;
+      if (i == prevIdx) { _drawSchedRow(row, i); break; }
+      row++;
+    }
+    _drawStatusBar();
+    return;
+  }
 
   int row = 0;
   for (int i = 0; i < MAX_SCHEDULES && row < 5; i++) {
     if (!schedules[i].used) continue;
     int y = SL_LIST_Y + row * (SL_ROW_H + SL_ROW_GAP);
-    // Run/Stop button
+    // Run/Stop button — redraw just that row + status bar
     if (_inRect(tx, ty, SL_RUN_X, y + 9, 120, SL_ROW_H - 18)) {
       if (runState.running && runState.scheduleIndex == i) stopSchedule();
       else startSchedule(i);
-      needsRedraw = true;
+      _drawSchedRow(row, i);
+      _drawStatusBar();
       return;
     }
-    // Row body → edit screen
+    // Row body → edit screen (full redraw needed for new screen)
     if (_inRect(tx, ty, 10, y, SCR_W - 20, SL_ROW_H)) {
       _loadEditState(i);
       currentScreen = SCR_EDIT;
@@ -432,13 +460,13 @@ void _handleEditTouch(int tx, int ty) {
   int sh   = NAV_Y - ED_SETT_Y;
   int sbty = sy + (sh - 26) / 2;
   if (_inRect(tx, ty, 15, sbty, 90, 26)) {
-    _editAutoRun = !_editAutoRun; needsRedraw = true; return;
+    _editAutoRun = !_editAutoRun; _drawEditSettings(); return;
   }
   if (_editAutoRun) {
-    if (_inRect(tx, ty, 175, sbty, 35, 26)) { _editHour = (_editHour + 23) % 24; needsRedraw = true; return; }
-    if (_inRect(tx, ty, 245, sbty, 35, 26)) { _editHour = (_editHour +  1) % 24; needsRedraw = true; return; }
-    if (_inRect(tx, ty, 300, sbty, 35, 26)) { _editMin  = (_editMin  + 55) % 60; needsRedraw = true; return; }
-    if (_inRect(tx, ty, 370, sbty, 35, 26)) { _editMin  = (_editMin  +  5) % 60; needsRedraw = true; return; }
+    if (_inRect(tx, ty, 175, sbty, 35, 26)) { _editHour = (_editHour + 23) % 24; _drawEditSettings(); return; }
+    if (_inRect(tx, ty, 245, sbty, 35, 26)) { _editHour = (_editHour +  1) % 24; _drawEditSettings(); return; }
+    if (_inRect(tx, ty, 300, sbty, 35, 26)) { _editMin  = (_editMin  + 55) % 60; _drawEditSettings(); return; }
+    if (_inRect(tx, ty, 370, sbty, 35, 26)) { _editMin  = (_editMin  +  5) % 60; _drawEditSettings(); return; }
   }
 
   // Zone rows
@@ -447,16 +475,16 @@ void _handleEditTouch(int tx, int ty) {
     int bty = y + (ED_ROW_H - 28) / 2;
     if (_inRect(tx, ty, ED_TOG_X, bty, ED_TOG_W, 28)) {
       _editZones[z].enabled = !_editZones[z].enabled;
-      needsRedraw = true; return;
+      _drawEditZoneRow(z); return;
     }
     if (_editZones[z].enabled) {
       if (_inRect(tx, ty, ED_DEC_X, bty, ED_DEC_W, 28)) {
         if (_editZones[z].durationMin > 1) _editZones[z].durationMin--;
-        needsRedraw = true; return;
+        _drawEditZoneRow(z); return;
       }
       if (_inRect(tx, ty, ED_INC_X, bty, ED_INC_W, 28)) {
         if (_editZones[z].durationMin < 99) _editZones[z].durationMin++;
-        needsRedraw = true; return;
+        _drawEditZoneRow(z); return;
       }
     }
   }
@@ -491,18 +519,29 @@ void displayStatus(const char* line1, const char* line2 = nullptr) {
 }
 
 void displayLoop() {
-  // Trigger redraw when the clock minute changes or run state changes
-  String nowTime = ntpReady ? ntpFormattedTime().substring(0, 5) : "";
-  if (nowTime != _lastTime)            { _lastTime = nowTime; needsRedraw = true; }
-  if (runState.running != _lastRunning) { _lastRunning = runState.running; needsRedraw = true; }
-
+  // Full redraw only when changing screens or on first boot
   if (needsRedraw) {
     switch (currentScreen) {
       case SCR_HOME:      _drawHomeScreen();      break;
       case SCR_SCHEDULES: _drawSchedulesScreen(); break;
       case SCR_EDIT:      _drawEditScreen();      break;
     }
-    needsRedraw = false;
+    needsRedraw  = false;
+    _lastTime    = ntpReady ? ntpFormattedTime().substring(0, 5) : "";
+    _lastRunning = runState.running;
+  }
+
+  // Update the clock region in the header when the minute changes
+  String nowTime = ntpReady ? ntpFormattedTime().substring(0, 5) : "";
+  if (nowTime != _lastTime) {
+    _lastTime = nowTime;
+    _updateClockDisplay();
+  }
+
+  // Update the status bar when run state starts or stops
+  if (runState.running != _lastRunning) {
+    _lastRunning = runState.running;
+    _drawStatusBar();
   }
 
   // Refresh status bar every second while a schedule is running
