@@ -558,7 +558,7 @@ void displayLoop() {
   static unsigned long _lastTouchMs = 0;
   if (_touched) {
     _touched = false;
-    if (millis() - _lastTouchMs > 350) {
+    if (millis() - _lastTouchMs > 150) {
       _lastTouchMs = millis();
       int tx = _touchX, ty = _touchY;
       switch (currentScreen) {
