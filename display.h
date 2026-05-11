@@ -63,15 +63,21 @@ String _lastTime     = "";
 bool   _lastRunning  = false;
 
 // Touch event — set by callback, consumed in displayLoop()
-volatile bool _touched = false;
-volatile int  _touchX  = 0;
-volatile int  _touchY  = 0;
+volatile bool _touched    = false;
+volatile int  _touchX     = 0;
+volatile int  _touchY     = 0;
+volatile bool _fingerDown = false;   // true while finger is on screen
 
 void _onTouch(uint8_t contacts, GDTpoint_t* pts) {
-  if (contacts > 0 && !_touched) {
-    _touchX  = SCR_W - pts[0].y;   // flipped landscape X
-    _touchY  = pts[0].x;            // flipped landscape Y
-    _touched = true;
+  if (contacts > 0 && !_fingerDown) {
+    // Finger just landed — record the position and fire one event
+    _touchX     = SCR_W - pts[0].y;   // flipped landscape X
+    _touchY     = pts[0].x;            // flipped landscape Y
+    _touched    = true;
+    _fingerDown = true;
+  } else if (contacts == 0) {
+    // Finger lifted — allow the next press to register
+    _fingerDown = false;
   }
 }
 
@@ -558,7 +564,7 @@ void displayLoop() {
   static unsigned long _lastTouchMs = 0;
   if (_touched) {
     _touched = false;
-    if (millis() - _lastTouchMs > 150) {
+    if (millis() - _lastTouchMs > 100) {
       _lastTouchMs = millis();
       int tx = _touchX, ty = _touchY;
       switch (currentScreen) {
