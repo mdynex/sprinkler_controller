@@ -89,6 +89,27 @@ void handleApi(WiFiClient& client, HttpRequest& req) {
   } else if (m == "POST" && p.startsWith("/zones/")) {
     routeZoneControl(client, req);
 
+  // PUT /zones/{id} — update zone settings (rate only for now)
+  } else if (m == "PUT" && p.startsWith("/zones/")) {
+    int id  = p.substring(7).toInt() - 1;
+    if (id < 0 || id >= ZONE_COUNT) {
+      sendResponse(client, 404, "{\"error\":\"zone not found\"}"); return;
+    }
+    StaticJsonDocument<64> doc;
+    if (deserializeJson(doc, req.body) != DeserializationError::Ok || !doc.containsKey("rate")) {
+      sendResponse(client, 400, "{\"error\":\"body must contain rate (in/hr)\"}"); return;
+    }
+    float rateF = doc["rate"].as<float>();
+    int tenths = (int)round(rateF * 10.0f);
+    if (tenths < 1 || tenths > 50) {
+      sendResponse(client, 400, "{\"error\":\"rate must be 0.1–5.0 in/hr\"}"); return;
+    }
+    zoneRate[id] = tenths;
+    char rateBuf[6];
+    formatRate(tenths, rateBuf, sizeof(rateBuf));
+    sendResponse(client, 200,
+      "{\"id\":" + String(id + 1) + ",\"rate\":" + rateBuf + "}");
+
   // GET /schedules — list all schedules
   } else if (m == "GET" && p == "/schedules") {
     sendResponse(client, 200, schedulesListJson());

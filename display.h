@@ -56,7 +56,7 @@ GigaDisplay_GFX          gfx;
 Arduino_GigaDisplayTouch touch;
 
 // ── Screen state ───────────────────────────────────────────────────────────
-enum Screen { SCR_HOME, SCR_SCHEDULES, SCR_EDIT };
+enum Screen { SCR_HOME, SCR_SCHEDULES, SCR_EDIT, SCR_ZONE_SETTINGS };
 Screen currentScreen = SCR_HOME;
 bool   needsRedraw   = true;
 String _lastTime     = "";
@@ -223,6 +223,16 @@ void _drawZoneBtn(int idx) {
   tw = strlen(st) * 12;
   gfx.setCursor(x + (ZN_W - tw) / 2, y + ZN_H / 2 + 8);
   gfx.print(st);
+
+  // Watering rate
+  char rate[12];
+  formatRate(zoneRate[idx], rate, sizeof(rate));
+  strncat(rate, " in/hr", sizeof(rate) - strlen(rate) - 1);
+  gfx.setTextSize(1);
+  gfx.setTextColor(C_DIM);
+  tw = strlen(rate) * 6;
+  gfx.setCursor(x + (ZN_W - tw) / 2, y + ZN_H - 18);
+  gfx.print(rate);
 }
 
 void _drawHomeScreen() {
@@ -230,8 +240,9 @@ void _drawHomeScreen() {
   _drawHeader("SPRINKLER CONTROLLER");
   for (int i = 0; i < ZONE_COUNT; i++) _drawZoneBtn(i);
   gfx.fillRect(0, NAV_Y, SCR_W, NAV_H, C_BG);
-  _btn(20,          NAV_Y + 10, 230, 50, C_GRAY, "SCHEDULES");
-  _btn(SCR_W - 250, NAV_Y + 10, 230, 50, C_RED,  "STOP ALL");
+  _btn( 20,  NAV_Y + 10, 220, 50, C_GRAY, "SCHEDULES");
+  _btn(290,  NAV_Y + 10, 220, 50, C_GRAY, "ZONES");
+  _btn(560,  NAV_Y + 10, 220, 50, C_RED,  "STOP ALL");
   _drawStatusBar();
 }
 
@@ -246,8 +257,9 @@ void _handleHomeTouch(int tx, int ty) {
       return;
     }
   }
-  if (_inRect(tx, ty, 20, NAV_Y + 10, 230, 50))          { currentScreen = SCR_SCHEDULES; needsRedraw = true; return; }
-  if (_inRect(tx, ty, SCR_W - 250, NAV_Y + 10, 230, 50)) {
+  if (_inRect(tx, ty,  20, NAV_Y + 10, 220, 50)) { currentScreen = SCR_SCHEDULES;    needsRedraw = true; return; }
+  if (_inRect(tx, ty, 290, NAV_Y + 10, 220, 50)) { currentScreen = SCR_ZONE_SETTINGS; needsRedraw = true; return; }
+  if (_inRect(tx, ty, 560, NAV_Y + 10, 220, 50)) {
     stopSchedule();
     for (int i = 0; i < ZONE_COUNT; i++) _drawZoneBtn(i);
     _drawStatusBar();
@@ -505,6 +517,72 @@ void _handleEditTouch(int tx, int ty) {
   }
 }
 
+// ── ZONE SETTINGS screen ───────────────────────────────────────────────────
+
+#define ZS_ROW_H   45
+#define ZS_DEC_X  390
+#define ZS_DEC_W   45
+#define ZS_VAL_X  440
+#define ZS_VAL_W   80
+#define ZS_INC_X  525
+#define ZS_INC_W   45
+
+void _drawZoneSettingsRow(int z) {
+  int y   = HDR_H + z * ZS_ROW_H;
+  int bty = y + (ZS_ROW_H - 28) / 2;
+  gfx.fillRect(0, y, SCR_W, ZS_ROW_H, z % 2 == 0 ? C_ROW_A : C_ROW_B);
+
+  gfx.setTextColor(C_WHITE);
+  gfx.setTextSize(2);
+  char lbl[8];
+  snprintf(lbl, sizeof(lbl), "Zone %d", z + 1);
+  gfx.setCursor(15, y + (ZS_ROW_H - 16) / 2);
+  gfx.print(lbl);
+
+  _btn(ZS_DEC_X, bty, ZS_DEC_W, 28, C_GRAY, "-");
+
+  char rate[6];
+  formatRate(zoneRate[z], rate, sizeof(rate));
+  gfx.setTextColor(C_WHITE);
+  gfx.setTextSize(2);
+  int tw = strlen(rate) * 12;
+  gfx.setCursor(ZS_VAL_X + (ZS_VAL_W - tw) / 2, y + (ZS_ROW_H - 16) / 2);
+  gfx.print(rate);
+
+  _btn(ZS_INC_X, bty, ZS_INC_W, 28, C_GRAY, "+");
+
+  gfx.setTextColor(C_DIM);
+  gfx.setTextSize(1);
+  gfx.setCursor(ZS_INC_X + ZS_INC_W + 8, y + (ZS_ROW_H - 8) / 2);
+  gfx.print("in/hr");
+}
+
+void _drawZoneSettingsScreen() {
+  gfx.fillScreen(C_BG);
+  _drawHeader("ZONE SETTINGS");
+  for (int z = 0; z < ZONE_COUNT; z++) _drawZoneSettingsRow(z);
+  gfx.fillRect(0, NAV_Y, SCR_W, NAV_H, C_BG);
+  _btn(20, NAV_Y + 10, 160, 50, C_GRAY, "BACK");
+  _drawStatusBar();
+}
+
+void _handleZoneSettingsTouch(int tx, int ty) {
+  if (_inRect(tx, ty, 20, NAV_Y + 10, 160, 50)) { currentScreen = SCR_HOME; needsRedraw = true; return; }
+
+  for (int z = 0; z < ZONE_COUNT; z++) {
+    int y   = HDR_H + z * ZS_ROW_H;
+    int bty = y + (ZS_ROW_H - 28) / 2;
+    if (_inRect(tx, ty, ZS_DEC_X, bty, ZS_DEC_W, 28)) {
+      if (zoneRate[z] > 1) zoneRate[z]--;
+      _drawZoneSettingsRow(z); return;
+    }
+    if (_inRect(tx, ty, ZS_INC_X, bty, ZS_INC_W, 28)) {
+      if (zoneRate[z] < 50) zoneRate[z]++;
+      _drawZoneSettingsRow(z); return;
+    }
+  }
+}
+
 // ── Public API ─────────────────────────────────────────────────────────────
 
 void displayInit() {
@@ -537,9 +615,10 @@ void displayLoop() {
   // Full redraw only when changing screens or on first boot
   if (needsRedraw) {
     switch (currentScreen) {
-      case SCR_HOME:      _drawHomeScreen();      break;
-      case SCR_SCHEDULES: _drawSchedulesScreen(); break;
-      case SCR_EDIT:      _drawEditScreen();      break;
+      case SCR_HOME:          _drawHomeScreen();          break;
+      case SCR_SCHEDULES:     _drawSchedulesScreen();     break;
+      case SCR_EDIT:          _drawEditScreen();          break;
+      case SCR_ZONE_SETTINGS: _drawZoneSettingsScreen();  break;
     }
     needsRedraw  = false;
     _lastTime    = ntpReady ? ntpFormattedTime().substring(0, 5) : "";
@@ -584,9 +663,10 @@ void displayLoop() {
       _lastTouchMs = millis();
       int tx = _touchX, ty = _touchY;
       switch (currentScreen) {
-        case SCR_HOME:      _handleHomeTouch(tx, ty);      break;
-        case SCR_SCHEDULES: _handleSchedulesTouch(tx, ty); break;
-        case SCR_EDIT:      _handleEditTouch(tx, ty);      break;
+        case SCR_HOME:          _handleHomeTouch(tx, ty);          break;
+        case SCR_SCHEDULES:     _handleSchedulesTouch(tx, ty);     break;
+        case SCR_EDIT:          _handleEditTouch(tx, ty);          break;
+        case SCR_ZONE_SETTINGS: _handleZoneSettingsTouch(tx, ty);  break;
       }
     }
   }
