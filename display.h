@@ -572,7 +572,7 @@ void displayLoop() {
     _lastContactSeenMs = millis();
     _contactSeen = false;
   }
-  if (_fingerDown && millis() - _lastContactSeenMs > 300) {
+  if (_fingerDown && millis() - _lastContactSeenMs > 150) {
     _fingerDown = false;
   }
 
