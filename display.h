@@ -203,7 +203,7 @@ void _drawZoneBtn(int idx) {
   gfx.setTextColor(C_WHITE);
   gfx.setTextSize(3);
   char top[8];
-  snprintf(top, sizeof(top), "Zn %d", idx + 1);
+  snprintf(top, sizeof(top), "Zone %d", idx + 1);
   int tw = strlen(top) * 18;
   gfx.setCursor(x + (ZN_W - tw) / 2, y + ZN_H / 2 - 24);
   gfx.print(top);
@@ -236,7 +236,11 @@ void _handleHomeTouch(int tx, int ty) {
     }
   }
   if (_inRect(tx, ty, 20, NAV_Y + 10, 230, 50))          { currentScreen = SCR_SCHEDULES; needsRedraw = true; return; }
-  if (_inRect(tx, ty, SCR_W - 250, NAV_Y + 10, 230, 50)) { stopSchedule(); _drawStatusBar(); }
+  if (_inRect(tx, ty, SCR_W - 250, NAV_Y + 10, 230, 50)) {
+    stopSchedule();
+    for (int i = 0; i < ZONE_COUNT; i++) _drawZoneBtn(i);
+    _drawStatusBar();
+  }
 }
 
 // ── SCHEDULES screen ───────────────────────────────────────────────────────
