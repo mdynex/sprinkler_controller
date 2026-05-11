@@ -63,22 +63,25 @@ String _lastTime     = "";
 bool   _lastRunning  = false;
 
 // Touch event — set by callback, consumed in displayLoop()
-volatile bool _touched    = false;
-volatile int  _touchX     = 0;
-volatile int  _touchY     = 0;
-volatile bool _fingerDown = false;   // true while finger is on screen
+volatile bool          _touched       = false;
+volatile int           _touchX        = 0;
+volatile int           _touchY        = 0;
+volatile bool          _fingerDown    = false;
+volatile unsigned long _lastContactMs = 0;   // last time the IC reported a contact
 
 void _onTouch(uint8_t contacts, GDTpoint_t* pts) {
-  if (contacts > 0 && !_fingerDown) {
-    // Finger just landed — record the position and fire one event
-    _touchX     = SCR_W - pts[0].y;   // flipped landscape X
-    _touchY     = pts[0].x;            // flipped landscape Y
-    _touched    = true;
-    _fingerDown = true;
-  } else if (contacts == 0) {
-    // Finger lifted — allow the next press to register
-    _fingerDown = false;
+  if (contacts > 0) {
+    _lastContactMs = millis();
+    if (!_fingerDown) {
+      // Finger just landed — record position and fire one event
+      _touchX     = SCR_W - pts[0].y;   // flipped landscape X
+      _touchY     = pts[0].x;            // flipped landscape Y
+      _touched    = true;
+      _fingerDown = true;
+    }
   }
+  // contacts == 0 is not always delivered by the GT911, so finger-up
+  // detection is handled by timeout in displayLoop()
 }
 
 // ── Edit screen state ──────────────────────────────────────────────────────
@@ -560,7 +563,12 @@ void displayLoop() {
     if (millis() - _lastSts >= 1000) { _drawStatusBar(); _lastSts = millis(); }
   }
 
-  // Consume touch event — ignore taps within 350ms of the last one
+  // Release finger-down lock if the IC has gone quiet for 200ms
+  if (_fingerDown && millis() - _lastContactMs > 200) {
+    _fingerDown = false;
+  }
+
+  // Consume touch event — ignore taps within 100ms of the last one
   static unsigned long _lastTouchMs = 0;
   if (_touched) {
     _touched = false;
