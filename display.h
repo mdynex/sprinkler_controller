@@ -63,25 +63,27 @@ String _lastTime     = "";
 bool   _lastRunning  = false;
 
 // Touch event — set by callback, consumed in displayLoop()
-volatile bool          _touched       = false;
-volatile int           _touchX        = 0;
-volatile int           _touchY        = 0;
-volatile bool          _fingerDown    = false;
-volatile unsigned long _lastContactMs = 0;   // last time the IC reported a contact
+volatile bool _touched     = false;
+volatile int  _touchX      = 0;
+volatile int  _touchY      = 0;
+volatile bool _fingerDown  = false;
+volatile bool _contactSeen = false;  // pulsed true by callback; timed in displayLoop
 
+// Keep the callback side-effect-free of millis() — mbed interrupt context
+// makes millis() unreliable. Only set simple boolean flags here; all timing
+// happens in displayLoop() where millis() is safe.
 void _onTouch(uint8_t contacts, GDTpoint_t* pts) {
   if (contacts > 0) {
-    _lastContactMs = millis();
+    _contactSeen = true;
     if (!_fingerDown) {
-      // Finger just landed — record position and fire one event
       _touchX     = SCR_W - pts[0].y;   // flipped landscape X
       _touchY     = pts[0].x;            // flipped landscape Y
       _touched    = true;
       _fingerDown = true;
     }
+  } else {
+    _fingerDown = false;   // explicit lift when the IC does report contacts==0
   }
-  // contacts == 0 is not always delivered by the GT911, so finger-up
-  // detection is handled by timeout in displayLoop()
 }
 
 // ── Edit screen state ──────────────────────────────────────────────────────
@@ -563,8 +565,14 @@ void displayLoop() {
     if (millis() - _lastSts >= 1000) { _drawStatusBar(); _lastSts = millis(); }
   }
 
-  // Release finger-down lock if the IC has gone quiet for 200ms
-  if (_fingerDown && millis() - _lastContactMs > 200) {
+  // Finger-up detection: timestamp _contactSeen pulses here (safe millis context),
+  // then release _fingerDown if the IC has been quiet for 300ms.
+  static unsigned long _lastContactSeenMs = 0;
+  if (_contactSeen) {
+    _lastContactSeenMs = millis();
+    _contactSeen = false;
+  }
+  if (_fingerDown && millis() - _lastContactSeenMs > 300) {
     _fingerDown = false;
   }
 
