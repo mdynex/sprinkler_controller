@@ -144,7 +144,7 @@ void _drawHeader(const char* title) {
   gfx.setCursor(15, 17);
   gfx.print(title);
   if (ntpReady) {
-    String t = ntpFormattedTime();
+    String t = ntpFormattedTime().substring(0, 5);  // show HH:MM only
     gfx.setCursor(SCR_W - 15 - (int)t.length() * 12, 17);
     gfx.print(t);
   }
