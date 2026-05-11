@@ -69,8 +69,8 @@ volatile int  _touchY  = 0;
 
 void _onTouch(uint8_t contacts, GDTpoint_t* pts) {
   if (contacts > 0 && !_touched) {
-    _touchX  = pts[0].x;
-    _touchY  = pts[0].y;
+    _touchX  = SCR_W - pts[0].y;   // flipped landscape X
+    _touchY  = pts[0].x;            // flipped landscape Y
     _touched = true;
   }
 }
@@ -466,11 +466,28 @@ void _handleEditTouch(int tx, int ty) {
 
 void displayInit() {
   gfx.begin();
-  gfx.setRotation(1);
+  gfx.setRotation(3);
   gfx.fillScreen(C_BG);
   touch.begin();
   touch.onDetect(_onTouch);
   needsRedraw = true;
+}
+
+// Show a full-screen status message during startup (before loop() runs).
+void displayStatus(const char* line1, const char* line2 = nullptr) {
+  gfx.fillScreen(C_BLACK);
+  gfx.setTextColor(C_WHITE);
+  gfx.setTextSize(3);
+  int tw = strlen(line1) * 18;
+  gfx.setCursor((SCR_W - tw) / 2, SCR_H / 2 - 30);
+  gfx.print(line1);
+  if (line2) {
+    gfx.setTextColor(C_DIM);
+    gfx.setTextSize(2);
+    tw = strlen(line2) * 12;
+    gfx.setCursor((SCR_W - tw) / 2, SCR_H / 2 + 20);
+    gfx.print(line2);
+  }
 }
 
 void displayLoop() {
@@ -494,14 +511,18 @@ void displayLoop() {
     if (millis() - _lastSts >= 1000) { _drawStatusBar(); _lastSts = millis(); }
   }
 
-  // Consume touch event set by callback
+  // Consume touch event — ignore taps within 350ms of the last one
+  static unsigned long _lastTouchMs = 0;
   if (_touched) {
-    int tx = _touchX, ty = _touchY;
     _touched = false;
-    switch (currentScreen) {
-      case SCR_HOME:      _handleHomeTouch(tx, ty);      break;
-      case SCR_SCHEDULES: _handleSchedulesTouch(tx, ty); break;
-      case SCR_EDIT:      _handleEditTouch(tx, ty);      break;
+    if (millis() - _lastTouchMs > 350) {
+      _lastTouchMs = millis();
+      int tx = _touchX, ty = _touchY;
+      switch (currentScreen) {
+        case SCR_HOME:      _handleHomeTouch(tx, ty);      break;
+        case SCR_SCHEDULES: _handleSchedulesTouch(tx, ty); break;
+        case SCR_EDIT:      _handleEditTouch(tx, ty);      break;
+      }
     }
   }
 }

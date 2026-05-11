@@ -46,11 +46,34 @@ void loop() {
 // ── WiFi ───────────────────────────────────────────────────────────────────
 
 void connectWiFi() {
-  Serial.print("Connecting to WiFi");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  displayStatus("Connecting to WiFi...", WIFI_SSID);
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  int attempt = 0;
+  while (true) {
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    unsigned long start = millis();
+    while (millis() - start < 10000) {  // wait up to 10s per attempt
+      if (WiFi.status() == WL_CONNECTED) {
+        String ip = WiFi.localIP().toString();
+        displayStatus("Connected!", ip.c_str());
+        Serial.print("Connected! IP: ");
+        Serial.println(ip);
+        delay(1000);
+        return;
+      }
+      delay(500);
+      Serial.print(".");
+    }
+    attempt++;
+    Serial.print("\nRetrying (attempt ");
+    Serial.print(attempt);
+    Serial.println(")...");
+    char msg[24];
+    snprintf(msg, sizeof(msg), "Retry %d...", attempt);
+    displayStatus(msg, WIFI_SSID);
+    WiFi.disconnect();
+    delay(1000);
   }
-  Serial.println(" connected");
 }
