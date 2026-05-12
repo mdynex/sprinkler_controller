@@ -136,9 +136,9 @@ bool _inRect(int tx, int ty, int x, int y, int w, int h) {
 }
 
 // Draws a rounded button with centered label. sz = GFX text size (1 or 2).
-void _btn(int x, int y, int w, int h, uint16_t color, const char* lbl, int sz = 2) {
+void _btn(int x, int y, int w, int h, uint16_t color, const char* lbl, int sz = 2, uint16_t textColor = C_WHITE) {
   gfx.fillRoundRect(x, y, w, h, 6, color);
-  gfx.setTextColor(C_WHITE);
+  gfx.setTextColor(textColor);
   gfx.setTextSize(sz);
   int tw = strlen(lbl) * sz * 6;
   int th = sz * 8;
@@ -310,7 +310,8 @@ void _drawSchedRow(int screenRow, int si) {
 
   _btn(SL_RUN_X, y + 9, 120, SL_ROW_H - 18,
        active ? C_RED : C_GREEN,
-       active ? "STOP" : "RUN");
+       active ? "STOP" : "RUN", 2,
+       active ? C_WHITE : C_BLACK);
 }
 
 void _drawSchedulesScreen() {
@@ -384,7 +385,8 @@ void _drawEditZoneRow(int z) {
   // Zone toggle
   _btn(ED_TOG_X, bty, ED_TOG_W, 28,
        _editZones[z].enabled ? C_GREEN : C_GRAY,
-       _editZones[z].enabled ? "ON" : "OFF", 1);
+       _editZones[z].enabled ? "ON" : "OFF", 1,
+       _editZones[z].enabled ? C_BLACK : C_WHITE);
 
   // Label
   gfx.setTextColor(C_WHITE);
@@ -426,7 +428,8 @@ void _drawEditSettings() {
 
   _btn(15, bty, 90, 26,
        _editAutoRun ? C_GREEN : C_GRAY,
-       _editAutoRun ? "AUTO ON" : "AUTO OFF", 1);
+       _editAutoRun ? "AUTO ON" : "AUTO OFF", 1,
+       _editAutoRun ? C_BLACK : C_WHITE);
 
   if (_editAutoRun) {
     gfx.setTextColor(C_WHITE);
@@ -471,7 +474,7 @@ void _drawEditScreen() {
   gfx.fillRect(0, NAV_Y, SCR_W, NAV_H, C_BG);
   _btn(20,          NAV_Y + 10, 160, 50, C_GRAY,  "CANCEL");
   _btn(320,         NAV_Y + 10, 160, 50, C_BLUE,  "SAVE");
-  _btn(SCR_W - 200, NAV_Y + 10, 180, 50, C_GREEN, "RUN NOW");
+  _btn(SCR_W - 200, NAV_Y + 10, 180, 50, C_GREEN, "RUN NOW", 2, C_BLACK);
   _drawStatusBar();
 }
 
@@ -544,7 +547,7 @@ void _drawZoneSettingsRow(int z) {
   gfx.fillRect(0, y, SCR_W, ZS_ROW_H, z % 2 == 0 ? C_ROW_A : C_ROW_B);
 
   // Enable/disable toggle
-  _btn(ZS_TOG_X, bty, ZS_TOG_W, 28, en ? C_GREEN : C_GRAY, en ? "ON" : "OFF", 1);
+  _btn(ZS_TOG_X, bty, ZS_TOG_W, 28, en ? C_GREEN : C_GRAY, en ? "ON" : "OFF", 1, en ? C_BLACK : C_WHITE);
 
   // Zone label
   gfx.setTextColor(en ? C_WHITE : C_DIM);
