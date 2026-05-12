@@ -177,15 +177,25 @@ bool parseScheduleBody(const String& body, Schedule& s) {
 
 // ── Schedule runner ────────────────────────────────────────────────────────
 
-// Start running a schedule from its first step.
-// Stops any currently running schedule first.
+// Start running a schedule, skipping any steps whose zone is disabled.
+// Stops any currently running schedule first. Does nothing if every step
+// in the schedule belongs to a disabled zone.
 void startSchedule(int index) {
   allZonesOff();
+  Schedule& sched = schedules[index];
+
+  // Find the first step with an enabled zone
+  int first = -1;
+  for (int i = 0; i < sched.stepCount; i++) {
+    if (zoneEnabled[sched.steps[i].zoneId - 1]) { first = i; break; }
+  }
+  if (first < 0) return;  // nothing enabled to run
+
   runState.running       = true;
   runState.scheduleIndex = index;
-  runState.stepIndex     = 0;
+  runState.stepIndex     = first;
   runState.stepStart     = millis();
-  setZone(schedules[index].steps[0].zoneId - 1, true);
+  setZone(sched.steps[first].zoneId - 1, true);
 }
 
 // Stop the running schedule and turn all zones off immediately.
@@ -205,13 +215,16 @@ void scheduleTick() {
 
   if (millis() - runState.stepStart >= (unsigned long)step.duration * 1000UL) {
     setZone(step.zoneId - 1, false);
-    runState.stepIndex++;
 
-    if (runState.stepIndex >= sched.stepCount) {
-      runState.running = false;  // all steps done
+    // Advance to the next step that has an enabled zone
+    int next = runState.stepIndex + 1;
+    while (next < sched.stepCount && !zoneEnabled[sched.steps[next].zoneId - 1]) next++;
+
+    if (next >= sched.stepCount) {
+      runState.running = false;  // all remaining steps disabled or done
     } else {
-      ZoneStep& next = sched.steps[runState.stepIndex];
-      setZone(next.zoneId - 1, true);
+      runState.stepIndex = next;
+      setZone(sched.steps[next].zoneId - 1, true);
       runState.stepStart = millis();
     }
   }

@@ -208,31 +208,37 @@ void _drawZoneBtn(int idx) {
   int row  = idx / ZN_COLS;
   int x    = ZN_PAD + col * (ZN_W + ZN_PAD);
   int y    = HDR_H  + ZN_PAD + row * (ZN_H + ZN_PAD);
-  uint16_t bg = zoneState[idx] ? C_GREEN : C_ZONE_OFF;
+
+  bool enabled = zoneEnabled[idx];
+  uint16_t bg  = !enabled ? C_DARKGRAY : (zoneState[idx] ? C_GREEN : C_ZONE_OFF);
   gfx.fillRoundRect(x, y, ZN_W, ZN_H, 10, bg);
-  gfx.drawRoundRect(x, y, ZN_W, ZN_H, 10, C_WHITE);
-  gfx.setTextColor(C_WHITE);
+  gfx.drawRoundRect(x, y, ZN_W, ZN_H, 10, enabled ? C_WHITE : C_GRAY);
+
+  gfx.setTextColor(enabled ? C_WHITE : C_DIM);
   gfx.setTextSize(3);
   char top[8];
   snprintf(top, sizeof(top), "Zone %d", idx + 1);
   int tw = strlen(top) * 18;
   gfx.setCursor(x + (ZN_W - tw) / 2, y + ZN_H / 2 - 24);
   gfx.print(top);
+
   gfx.setTextSize(2);
-  const char* st = zoneState[idx] ? "ON" : "OFF";
+  const char* st = !enabled ? "OFF" : (zoneState[idx] ? "ON" : "OFF");
   tw = strlen(st) * 12;
   gfx.setCursor(x + (ZN_W - tw) / 2, y + ZN_H / 2 + 8);
   gfx.print(st);
 
-  // Watering rate
-  char rate[12];
-  formatRate(zoneRate[idx], rate, sizeof(rate));
-  strncat(rate, " in/hr", sizeof(rate) - strlen(rate) - 1);
-  gfx.setTextSize(1);
-  gfx.setTextColor(C_DIM);
-  tw = strlen(rate) * 6;
-  gfx.setCursor(x + (ZN_W - tw) / 2, y + ZN_H - 18);
-  gfx.print(rate);
+  // Watering rate (hidden when disabled)
+  if (enabled) {
+    char rate[12];
+    formatRate(zoneRate[idx], rate, sizeof(rate));
+    strncat(rate, " in/hr", sizeof(rate) - strlen(rate) - 1);
+    gfx.setTextSize(1);
+    gfx.setTextColor(C_DIM);
+    tw = strlen(rate) * 6;
+    gfx.setCursor(x + (ZN_W - tw) / 2, y + ZN_H - 18);
+    gfx.print(rate);
+  }
 }
 
 void _drawHomeScreen() {
@@ -251,9 +257,11 @@ void _handleHomeTouch(int tx, int ty) {
     int x = ZN_PAD + (i % ZN_COLS) * (ZN_W + ZN_PAD);
     int y = HDR_H  + ZN_PAD + (i / ZN_COLS) * (ZN_H + ZN_PAD);
     if (_inRect(tx, ty, x, y, ZN_W, ZN_H)) {
-      setZone(i, !zoneState[i]);
-      _drawZoneBtn(i);       // redraw just this button
-      _drawStatusBar();
+      if (zoneEnabled[i]) {
+        setZone(i, !zoneState[i]);
+        _drawZoneBtn(i);
+        _drawStatusBar();
+      }
       return;
     }
   }
@@ -520,41 +528,53 @@ void _handleEditTouch(int tx, int ty) {
 // ── ZONE SETTINGS screen ───────────────────────────────────────────────────
 
 #define ZS_ROW_H   45
-#define ZS_DEC_X  390
-#define ZS_DEC_W   45
-#define ZS_VAL_X  440
-#define ZS_VAL_W   80
-#define ZS_INC_X  525
-#define ZS_INC_W   45
+#define ZS_TOG_X    15
+#define ZS_TOG_W    80
+#define ZS_DEC_X   390
+#define ZS_DEC_W    45
+#define ZS_VAL_X   440
+#define ZS_VAL_W    80
+#define ZS_INC_X   525
+#define ZS_INC_W    45
 
 void _drawZoneSettingsRow(int z) {
   int y   = HDR_H + z * ZS_ROW_H;
   int bty = y + (ZS_ROW_H - 28) / 2;
+  bool en = zoneEnabled[z];
   gfx.fillRect(0, y, SCR_W, ZS_ROW_H, z % 2 == 0 ? C_ROW_A : C_ROW_B);
 
-  gfx.setTextColor(C_WHITE);
+  // Enable/disable toggle
+  _btn(ZS_TOG_X, bty, ZS_TOG_W, 28, en ? C_GREEN : C_GRAY, en ? "ON" : "OFF", 1);
+
+  // Zone label
+  gfx.setTextColor(en ? C_WHITE : C_DIM);
   gfx.setTextSize(2);
   char lbl[8];
   snprintf(lbl, sizeof(lbl), "Zone %d", z + 1);
-  gfx.setCursor(15, y + (ZS_ROW_H - 16) / 2);
+  gfx.setCursor(105, y + (ZS_ROW_H - 16) / 2);
   gfx.print(lbl);
 
-  _btn(ZS_DEC_X, bty, ZS_DEC_W, 28, C_GRAY, "-");
-
-  char rate[6];
-  formatRate(zoneRate[z], rate, sizeof(rate));
-  gfx.setTextColor(C_WHITE);
-  gfx.setTextSize(2);
-  int tw = strlen(rate) * 12;
-  gfx.setCursor(ZS_VAL_X + (ZS_VAL_W - tw) / 2, y + (ZS_ROW_H - 16) / 2);
-  gfx.print(rate);
-
-  _btn(ZS_INC_X, bty, ZS_INC_W, 28, C_GRAY, "+");
-
-  gfx.setTextColor(C_DIM);
-  gfx.setTextSize(1);
-  gfx.setCursor(ZS_INC_X + ZS_INC_W + 8, y + (ZS_ROW_H - 8) / 2);
-  gfx.print("in/hr");
+  // Rate controls (dimmed when disabled)
+  if (en) {
+    _btn(ZS_DEC_X, bty, ZS_DEC_W, 28, C_GRAY, "-");
+    char rate[6];
+    formatRate(zoneRate[z], rate, sizeof(rate));
+    gfx.setTextColor(C_WHITE);
+    gfx.setTextSize(2);
+    int tw = strlen(rate) * 12;
+    gfx.setCursor(ZS_VAL_X + (ZS_VAL_W - tw) / 2, y + (ZS_ROW_H - 16) / 2);
+    gfx.print(rate);
+    _btn(ZS_INC_X, bty, ZS_INC_W, 28, C_GRAY, "+");
+    gfx.setTextColor(C_DIM);
+    gfx.setTextSize(1);
+    gfx.setCursor(ZS_INC_X + ZS_INC_W + 8, y + (ZS_ROW_H - 8) / 2);
+    gfx.print("in/hr");
+  } else {
+    gfx.setTextColor(C_DIM);
+    gfx.setTextSize(1);
+    gfx.setCursor(ZS_DEC_X, y + (ZS_ROW_H - 8) / 2);
+    gfx.print("disabled");
+  }
 }
 
 void _drawZoneSettingsScreen() {
@@ -572,13 +592,20 @@ void _handleZoneSettingsTouch(int tx, int ty) {
   for (int z = 0; z < ZONE_COUNT; z++) {
     int y   = HDR_H + z * ZS_ROW_H;
     int bty = y + (ZS_ROW_H - 28) / 2;
-    if (_inRect(tx, ty, ZS_DEC_X, bty, ZS_DEC_W, 28)) {
-      if (zoneRate[z] > 1) zoneRate[z]--;
+    if (_inRect(tx, ty, ZS_TOG_X, bty, ZS_TOG_W, 28)) {
+      zoneEnabled[z] = !zoneEnabled[z];
+      if (!zoneEnabled[z]) setZone(z, false);  // turn off immediately if disabled
       _drawZoneSettingsRow(z); return;
     }
-    if (_inRect(tx, ty, ZS_INC_X, bty, ZS_INC_W, 28)) {
-      if (zoneRate[z] < 50) zoneRate[z]++;
-      _drawZoneSettingsRow(z); return;
+    if (zoneEnabled[z]) {
+      if (_inRect(tx, ty, ZS_DEC_X, bty, ZS_DEC_W, 28)) {
+        if (zoneRate[z] > 1) zoneRate[z]--;
+        _drawZoneSettingsRow(z); return;
+      }
+      if (_inRect(tx, ty, ZS_INC_X, bty, ZS_INC_W, 28)) {
+        if (zoneRate[z] < 50) zoneRate[z]++;
+        _drawZoneSettingsRow(z); return;
+      }
     }
   }
 }

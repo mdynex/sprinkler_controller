@@ -96,19 +96,26 @@ void handleApi(WiFiClient& client, HttpRequest& req) {
       sendResponse(client, 404, "{\"error\":\"zone not found\"}"); return;
     }
     StaticJsonDocument<64> doc;
-    if (deserializeJson(doc, req.body) != DeserializationError::Ok || !doc.containsKey("rate")) {
-      sendResponse(client, 400, "{\"error\":\"body must contain rate (in/hr)\"}"); return;
+    if (deserializeJson(doc, req.body) != DeserializationError::Ok) {
+      sendResponse(client, 400, "{\"error\":\"invalid JSON body\"}"); return;
     }
-    float rateF = doc["rate"].as<float>();
-    int tenths = (int)round(rateF * 10.0f);
-    if (tenths < 1 || tenths > 50) {
-      sendResponse(client, 400, "{\"error\":\"rate must be 0.1–5.0 in/hr\"}"); return;
+    if (doc.containsKey("enabled")) {
+      zoneEnabled[id] = doc["enabled"].as<bool>();
+      if (!zoneEnabled[id]) setZone(id, false);  // turn off immediately if disabled
     }
-    zoneRate[id] = tenths;
+    if (doc.containsKey("rate")) {
+      int tenths = (int)round(doc["rate"].as<float>() * 10.0f);
+      if (tenths < 1 || tenths > 50) {
+        sendResponse(client, 400, "{\"error\":\"rate must be 0.1–5.0 in/hr\"}"); return;
+      }
+      zoneRate[id] = tenths;
+    }
     char rateBuf[6];
-    formatRate(tenths, rateBuf, sizeof(rateBuf));
+    formatRate(zoneRate[id], rateBuf, sizeof(rateBuf));
     sendResponse(client, 200,
-      "{\"id\":" + String(id + 1) + ",\"rate\":" + rateBuf + "}");
+      "{\"id\":"      + String(id + 1) +
+      ",\"enabled\":" + (zoneEnabled[id] ? "true" : "false") +
+      ",\"rate\":"    + rateBuf + "}");
 
   // GET /schedules — list all schedules
   } else if (m == "GET" && p == "/schedules") {

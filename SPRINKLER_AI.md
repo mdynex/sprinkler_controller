@@ -33,8 +33,8 @@ There are **8 zones** (ids 1–8). Zones run one at a time; only one schedule ca
 ### GET /zones
 ```json
 [
-  {"id": 1, "state": "off", "rate": 1.0},
-  {"id": 2, "state": "on",  "rate": 1.5}
+  {"id": 1, "enabled": true,  "state": "off", "rate": 1.0},
+  {"id": 2, "enabled": false, "state": "off", "rate": 1.5}
 ]
 ```
 
@@ -44,13 +44,15 @@ No body required.
 {"id": 2, "state": "on"}
 ```
 
-### PUT /zones/{id} — set watering rate
+### PUT /zones/{id} — update zone settings
+Either or both fields may be included in one request.
 ```json
-{"rate": 1.5}
+{"enabled": false, "rate": 1.5}
 ```
+- `enabled`: `true` / `false` — disabled zones are skipped by the scheduler and cannot be toggled
 - `rate`: inches per hour, **0.1 – 5.0**, one decimal place
 ```json
-{"id": 2, "rate": 1.5}
+{"id": 2, "enabled": false, "rate": 1.5}
 ```
 
 ---

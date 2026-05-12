@@ -15,6 +15,10 @@
 // Current on/off state for each zone (index 0 = Zone 1, etc.)
 bool zoneState[ZONE_COUNT] = {false};
 
+// Whether each zone is enabled. Disabled zones are skipped by the schedule
+// runner and cannot be toggled from the display. Use this for unconnected zones.
+bool zoneEnabled[ZONE_COUNT];
+
 // Watering rate per zone in tenths of an inch per hour (10 = 1.0 in/hr).
 // Range 1–50 (0.1–5.0 in/hr). Default 10 (1.0 in/hr).
 int zoneRate[ZONE_COUNT];
@@ -30,7 +34,8 @@ void zonesInit() {
   for (int i = 0; i < ZONE_COUNT; i++) {
     pinMode(ZONE_PINS[i], OUTPUT);
     digitalWrite(ZONE_PINS[i], HIGH);  // HIGH = off on a low-trigger relay
-    zoneRate[i] = 10;                  // default 1.0 in/hr
+    zoneEnabled[i] = true;             // all zones enabled by default
+    zoneRate[i]    = 10;               // default 1.0 in/hr
   }
 }
 
@@ -55,8 +60,9 @@ String zonesJson() {
     char rate[6];
     formatRate(zoneRate[i], rate, sizeof(rate));
     json += "{\"id\":" + String(i + 1)
-          + ",\"state\":\"" + (zoneState[i] ? "on" : "off") + "\""
-          + ",\"rate\":" + rate + "}";
+          + ",\"enabled\":"  + (zoneEnabled[i] ? "true" : "false")
+          + ",\"state\":\""  + (zoneState[i] ? "on" : "off") + "\""
+          + ",\"rate\":"     + rate + "}";
   }
   json += "]";
   return json;
