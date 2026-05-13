@@ -15,11 +15,27 @@
 // Current on/off state for each zone (index 0 = Zone 1, etc.)
 bool zoneState[ZONE_COUNT] = {false};
 
-// Set all relay pins to HIGH (off) and configure them as outputs.
+// Whether each zone is enabled. Disabled zones are skipped by the schedule
+// runner and cannot be toggled from the display. Use this for unconnected zones.
+bool zoneEnabled[ZONE_COUNT];
+
+// Watering rate per zone in tenths of an inch per hour (10 = 1.0 in/hr).
+// Range 1–50 (0.1–5.0 in/hr). Default 10 (1.0 in/hr).
+int zoneRate[ZONE_COUNT];
+
+// Format a rate value (tenths) as "X.X" into buf (needs at least 5 bytes).
+void formatRate(int tenths, char* buf, int bufLen) {
+  snprintf(buf, bufLen, "%d.%d", tenths / 10, tenths % 10);
+}
+
+// Set all relay pins to HIGH (off), configure them as outputs, and set
+// default watering rates.
 void zonesInit() {
   for (int i = 0; i < ZONE_COUNT; i++) {
     pinMode(ZONE_PINS[i], OUTPUT);
     digitalWrite(ZONE_PINS[i], HIGH);  // HIGH = off on a low-trigger relay
+    zoneEnabled[i] = true;             // all zones enabled by default
+    zoneRate[i]    = 10;               // default 1.0 in/hr
   }
 }
 
@@ -35,13 +51,18 @@ void allZonesOff() {
   for (int i = 0; i < ZONE_COUNT; i++) setZone(i, false);
 }
 
-// Build a JSON array of all zones and their current state, e.g.:
-// [{"id":1,"state":"off"},{"id":2,"state":"on"}, ...]
+// Build a JSON array of all zones with their state and watering rate, e.g.:
+// [{"id":1,"state":"off","rate":1.0}, ...]
 String zonesJson() {
   String json = "[";
   for (int i = 0; i < ZONE_COUNT; i++) {
     if (i > 0) json += ",";
-    json += "{\"id\":" + String(i + 1) + ",\"state\":\"" + (zoneState[i] ? "on" : "off") + "\"}";
+    char rate[6];
+    formatRate(zoneRate[i], rate, sizeof(rate));
+    json += "{\"id\":" + String(i + 1)
+          + ",\"enabled\":"  + (zoneEnabled[i] ? "true" : "false")
+          + ",\"state\":\""  + (zoneState[i] ? "on" : "off") + "\""
+          + ",\"rate\":"     + rate + "}";
   }
   json += "]";
   return json;

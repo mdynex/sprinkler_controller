@@ -4,6 +4,9 @@
 #include "schedules.h"
 #include "ntp.h"
 
+extern bool needsRedraw;   // defined in display.h — set true to trigger full screen refresh
+extern void wakeDisplay(); // defined in display.h — wakes backlight and resets sleep timer
+
 // =============================================================================
 // api.h — REST API route handlers
 //
@@ -56,6 +59,8 @@ void routeZoneControl(WiFiClient& client, HttpRequest& req) {
     sendResponse(client, 400, "{\"error\":\"action must be on or off\"}"); return;
   }
   setZone(id, action == "on");
+  needsRedraw = true;
+  wakeDisplay();
   sendResponse(client, 200,
     "{\"id\":" + String(id + 1) + ",\"state\":\"" + action + "\"}");
 }
@@ -68,6 +73,8 @@ void routeRunSchedule(WiFiClient& client, const String& path) {
   if (idx < 0) { sendResponse(client, 404, "{\"error\":\"schedule not found\"}"); return; }
 
   startSchedule(idx);
+  needsRedraw = true;
+  wakeDisplay();
   sendResponse(client, 200,
     "{\"started\":true,\"schedule_id\":" + String(schedules[idx].id) + "}");
 }
@@ -88,6 +95,36 @@ void handleApi(WiFiClient& client, HttpRequest& req) {
   // POST /zones/{id}/on|off — control a single zone
   } else if (m == "POST" && p.startsWith("/zones/")) {
     routeZoneControl(client, req);
+
+  // PUT /zones/{id} — update zone settings (rate only for now)
+  } else if (m == "PUT" && p.startsWith("/zones/")) {
+    int id  = p.substring(7).toInt() - 1;
+    if (id < 0 || id >= ZONE_COUNT) {
+      sendResponse(client, 404, "{\"error\":\"zone not found\"}"); return;
+    }
+    StaticJsonDocument<64> doc;
+    if (deserializeJson(doc, req.body) != DeserializationError::Ok) {
+      sendResponse(client, 400, "{\"error\":\"invalid JSON body\"}"); return;
+    }
+    if (doc.containsKey("enabled")) {
+      zoneEnabled[id] = doc["enabled"].as<bool>();
+      if (!zoneEnabled[id]) setZone(id, false);  // turn off immediately if disabled
+      needsRedraw = true;
+      wakeDisplay();
+    }
+    if (doc.containsKey("rate")) {
+      int tenths = (int)round(doc["rate"].as<float>() * 10.0f);
+      if (tenths < 1 || tenths > 50) {
+        sendResponse(client, 400, "{\"error\":\"rate must be 0.1–5.0 in/hr\"}"); return;
+      }
+      zoneRate[id] = tenths;
+    }
+    char rateBuf[6];
+    formatRate(zoneRate[id], rateBuf, sizeof(rateBuf));
+    sendResponse(client, 200,
+      "{\"id\":"      + String(id + 1) +
+      ",\"enabled\":" + (zoneEnabled[id] ? "true" : "false") +
+      ",\"rate\":"    + rateBuf + "}");
 
   // GET /schedules — list all schedules
   } else if (m == "GET" && p == "/schedules") {
@@ -146,6 +183,8 @@ void handleApi(WiFiClient& client, HttpRequest& req) {
   // POST /schedules/stop — stop whatever is currently running
   } else if (m == "POST" && p == "/schedules/stop") {
     stopSchedule();
+    needsRedraw = true;
+    wakeDisplay();
     sendResponse(client, 200, "{\"stopped\":true}");
 
   } else {

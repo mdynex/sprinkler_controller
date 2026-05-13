@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino_GigaDisplay_GFX.h>
 #include <Arduino_GigaDisplayTouch.h>
+#include <Arduino_GigaDisplay.h>
 #include "zones.h"
 #include "schedules.h"
 #include "ntp.h"
@@ -54,24 +55,39 @@
 // ── Global objects ─────────────────────────────────────────────────────────
 GigaDisplay_GFX          gfx;
 Arduino_GigaDisplayTouch touch;
+GigaDisplayBacklight     _backlight;
 
 // ── Screen state ───────────────────────────────────────────────────────────
-enum Screen { SCR_HOME, SCR_SCHEDULES, SCR_EDIT };
-Screen currentScreen = SCR_HOME;
-bool   needsRedraw   = true;
-String _lastTime     = "";
-bool   _lastRunning  = false;
+enum Screen { SCR_HOME, SCR_SCHEDULES, SCR_EDIT, SCR_ZONE_SETTINGS };
+Screen        currentScreen   = SCR_HOME;
+bool          needsRedraw     = true;
+String        _lastTime       = "";
+bool          _lastRunning    = false;
+bool          _displayAsleep  = false;
+bool          _pendingWake    = false;
+unsigned long _lastActivityMs = 0;
 
 // Touch event — set by callback, consumed in displayLoop()
-volatile bool _touched = false;
-volatile int  _touchX  = 0;
-volatile int  _touchY  = 0;
+volatile bool _touched     = false;
+volatile int  _touchX      = 0;
+volatile int  _touchY      = 0;
+volatile bool _fingerDown  = false;
+volatile bool _contactSeen = false;  // pulsed true by callback; timed in displayLoop
 
+// Keep the callback side-effect-free of millis() — mbed interrupt context
+// makes millis() unreliable. Only set simple boolean flags here; all timing
+// happens in displayLoop() where millis() is safe.
 void _onTouch(uint8_t contacts, GDTpoint_t* pts) {
-  if (contacts > 0 && !_touched) {
-    _touchX  = SCR_W - pts[0].y;   // flipped landscape X
-    _touchY  = pts[0].x;            // flipped landscape Y
-    _touched = true;
+  if (contacts > 0) {
+    _contactSeen = true;
+    if (!_fingerDown) {
+      _touchX     = SCR_W - pts[0].y;   // flipped landscape X
+      _touchY     = pts[0].x;            // flipped landscape Y
+      _touched    = true;
+      _fingerDown = true;
+    }
+  } else {
+    _fingerDown = false;   // explicit lift when the IC does report contacts==0
   }
 }
 
@@ -118,6 +134,20 @@ void _saveEditState() {
   }
 }
 
+// ── Sleep / wake ───────────────────────────────────────────────────────────
+
+// Safe to call from anywhere (including WiFi request handlers).
+// Actual backlight/redraw happens in displayLoop() to avoid hardware conflicts.
+void wakeDisplay() {
+  _lastActivityMs = millis();
+  if (_displayAsleep) _pendingWake = true;
+}
+
+void _sleepDisplay() {
+  _backlight.set(0);
+  _displayAsleep = true;
+}
+
 // ── Drawing utilities ──────────────────────────────────────────────────────
 
 bool _inRect(int tx, int ty, int x, int y, int w, int h) {
@@ -125,9 +155,9 @@ bool _inRect(int tx, int ty, int x, int y, int w, int h) {
 }
 
 // Draws a rounded button with centered label. sz = GFX text size (1 or 2).
-void _btn(int x, int y, int w, int h, uint16_t color, const char* lbl, int sz = 2) {
+void _btn(int x, int y, int w, int h, uint16_t color, const char* lbl, int sz = 2, uint16_t textColor = C_WHITE) {
   gfx.fillRoundRect(x, y, w, h, 6, color);
-  gfx.setTextColor(C_WHITE);
+  gfx.setTextColor(textColor);
   gfx.setTextSize(sz);
   int tw = strlen(lbl) * sz * 6;
   int th = sz * 8;
@@ -144,7 +174,21 @@ void _drawHeader(const char* title) {
   gfx.setCursor(15, 17);
   gfx.print(title);
   if (ntpReady) {
-    String t = ntpFormattedTime();
+    String t = ntpFormattedTime().substring(0, 5);  // show HH:MM only
+    gfx.setCursor(SCR_W - 15 - (int)t.length() * 12, 17);
+    gfx.print(t);
+  }
+}
+
+// Redraws only the clock region in the header — avoids a full screen redraw
+// when the minute ticks over.
+void _updateClockDisplay() {
+  // Erase the right side of the header where the clock lives
+  gfx.fillRect(SCR_W - 90, 0, 90, HDR_H, C_BLACK);
+  if (ntpReady) {
+    String t = ntpFormattedTime().substring(0, 5);
+    gfx.setTextColor(C_WHITE);
+    gfx.setTextSize(2);
     gfx.setCursor(SCR_W - 15 - (int)t.length() * 12, 17);
     gfx.print(t);
   }
@@ -183,21 +227,37 @@ void _drawZoneBtn(int idx) {
   int row  = idx / ZN_COLS;
   int x    = ZN_PAD + col * (ZN_W + ZN_PAD);
   int y    = HDR_H  + ZN_PAD + row * (ZN_H + ZN_PAD);
-  uint16_t bg = zoneState[idx] ? C_GREEN : C_ZONE_OFF;
+
+  bool enabled = zoneEnabled[idx];
+  uint16_t bg  = !enabled ? C_DARKGRAY : (zoneState[idx] ? C_GREEN : C_ZONE_OFF);
   gfx.fillRoundRect(x, y, ZN_W, ZN_H, 10, bg);
-  gfx.drawRoundRect(x, y, ZN_W, ZN_H, 10, C_WHITE);
-  gfx.setTextColor(C_WHITE);
+  gfx.drawRoundRect(x, y, ZN_W, ZN_H, 10, enabled ? C_WHITE : C_GRAY);
+
+  gfx.setTextColor(enabled ? C_WHITE : C_DIM);
   gfx.setTextSize(3);
   char top[8];
-  snprintf(top, sizeof(top), "Zn %d", idx + 1);
+  snprintf(top, sizeof(top), "Zone %d", idx + 1);
   int tw = strlen(top) * 18;
   gfx.setCursor(x + (ZN_W - tw) / 2, y + ZN_H / 2 - 24);
   gfx.print(top);
+
   gfx.setTextSize(2);
-  const char* st = zoneState[idx] ? "ON" : "OFF";
+  const char* st = !enabled ? "OFF" : (zoneState[idx] ? "ON" : "OFF");
   tw = strlen(st) * 12;
   gfx.setCursor(x + (ZN_W - tw) / 2, y + ZN_H / 2 + 8);
   gfx.print(st);
+
+  // Watering rate (hidden when disabled)
+  if (enabled) {
+    char rate[12];
+    formatRate(zoneRate[idx], rate, sizeof(rate));
+    strncat(rate, " in/hr", sizeof(rate) - strlen(rate) - 1);
+    gfx.setTextSize(1);
+    gfx.setTextColor(C_DIM);
+    tw = strlen(rate) * 6;
+    gfx.setCursor(x + (ZN_W - tw) / 2, y + ZN_H - 18);
+    gfx.print(rate);
+  }
 }
 
 void _drawHomeScreen() {
@@ -205,8 +265,9 @@ void _drawHomeScreen() {
   _drawHeader("SPRINKLER CONTROLLER");
   for (int i = 0; i < ZONE_COUNT; i++) _drawZoneBtn(i);
   gfx.fillRect(0, NAV_Y, SCR_W, NAV_H, C_BG);
-  _btn(20,          NAV_Y + 10, 230, 50, C_GRAY, "SCHEDULES");
-  _btn(SCR_W - 250, NAV_Y + 10, 230, 50, C_RED,  "STOP ALL");
+  _btn( 20,  NAV_Y + 10, 220, 50, C_GRAY, "SCHEDULES");
+  _btn(290,  NAV_Y + 10, 220, 50, C_GRAY, "ZONES");
+  _btn(560,  NAV_Y + 10, 220, 50, C_RED,  "STOP ALL");
   _drawStatusBar();
 }
 
@@ -215,13 +276,21 @@ void _handleHomeTouch(int tx, int ty) {
     int x = ZN_PAD + (i % ZN_COLS) * (ZN_W + ZN_PAD);
     int y = HDR_H  + ZN_PAD + (i / ZN_COLS) * (ZN_H + ZN_PAD);
     if (_inRect(tx, ty, x, y, ZN_W, ZN_H)) {
-      setZone(i, !zoneState[i]);
-      needsRedraw = true;
+      if (zoneEnabled[i]) {
+        setZone(i, !zoneState[i]);
+        _drawZoneBtn(i);
+        _drawStatusBar();
+      }
       return;
     }
   }
-  if (_inRect(tx, ty, 20, NAV_Y + 10, 230, 50))        { currentScreen = SCR_SCHEDULES; needsRedraw = true; }
-  if (_inRect(tx, ty, SCR_W - 250, NAV_Y + 10, 230, 50)) { stopSchedule(); needsRedraw = true; }
+  if (_inRect(tx, ty,  20, NAV_Y + 10, 220, 50)) { currentScreen = SCR_SCHEDULES;    needsRedraw = true; return; }
+  if (_inRect(tx, ty, 290, NAV_Y + 10, 220, 50)) { currentScreen = SCR_ZONE_SETTINGS; needsRedraw = true; return; }
+  if (_inRect(tx, ty, 560, NAV_Y + 10, 220, 50)) {
+    stopSchedule();
+    for (int i = 0; i < ZONE_COUNT; i++) _drawZoneBtn(i);
+    _drawStatusBar();
+  }
 }
 
 // ── SCHEDULES screen ───────────────────────────────────────────────────────
@@ -260,7 +329,8 @@ void _drawSchedRow(int screenRow, int si) {
 
   _btn(SL_RUN_X, y + 9, 120, SL_ROW_H - 18,
        active ? C_RED : C_GREEN,
-       active ? "STOP" : "RUN");
+       active ? "STOP" : "RUN", 2,
+       active ? C_WHITE : C_BLACK);
 }
 
 void _drawSchedulesScreen() {
@@ -286,21 +356,34 @@ void _drawSchedulesScreen() {
 }
 
 void _handleSchedulesTouch(int tx, int ty) {
-  if (_inRect(tx, ty, 20, NAV_Y + 10, 160, 50))        { currentScreen = SCR_HOME; needsRedraw = true; return; }
-  if (_inRect(tx, ty, SCR_W - 250, NAV_Y + 10, 230, 50)) { stopSchedule(); needsRedraw = true; return; }
+  if (_inRect(tx, ty, 20, NAV_Y + 10, 160, 50))          { currentScreen = SCR_HOME; needsRedraw = true; return; }
+  if (_inRect(tx, ty, SCR_W - 250, NAV_Y + 10, 230, 50)) {
+    // Stop the running schedule; redraw only the row that changed + status bar
+    int prevIdx = runState.scheduleIndex;
+    stopSchedule();
+    int row = 0;
+    for (int i = 0; i < MAX_SCHEDULES && row < 5; i++) {
+      if (!schedules[i].used) continue;
+      if (i == prevIdx) { _drawSchedRow(row, i); break; }
+      row++;
+    }
+    _drawStatusBar();
+    return;
+  }
 
   int row = 0;
   for (int i = 0; i < MAX_SCHEDULES && row < 5; i++) {
     if (!schedules[i].used) continue;
     int y = SL_LIST_Y + row * (SL_ROW_H + SL_ROW_GAP);
-    // Run/Stop button
+    // Run/Stop button — redraw just that row + status bar
     if (_inRect(tx, ty, SL_RUN_X, y + 9, 120, SL_ROW_H - 18)) {
       if (runState.running && runState.scheduleIndex == i) stopSchedule();
       else startSchedule(i);
-      needsRedraw = true;
+      _drawSchedRow(row, i);
+      _drawStatusBar();
       return;
     }
-    // Row body → edit screen
+    // Row body → edit screen (full redraw needed for new screen)
     if (_inRect(tx, ty, 10, y, SCR_W - 20, SL_ROW_H)) {
       _loadEditState(i);
       currentScreen = SCR_EDIT;
@@ -321,7 +404,8 @@ void _drawEditZoneRow(int z) {
   // Zone toggle
   _btn(ED_TOG_X, bty, ED_TOG_W, 28,
        _editZones[z].enabled ? C_GREEN : C_GRAY,
-       _editZones[z].enabled ? "ON" : "OFF", 1);
+       _editZones[z].enabled ? "ON" : "OFF", 1,
+       _editZones[z].enabled ? C_BLACK : C_WHITE);
 
   // Label
   gfx.setTextColor(C_WHITE);
@@ -363,7 +447,8 @@ void _drawEditSettings() {
 
   _btn(15, bty, 90, 26,
        _editAutoRun ? C_GREEN : C_GRAY,
-       _editAutoRun ? "AUTO ON" : "AUTO OFF", 1);
+       _editAutoRun ? "AUTO ON" : "AUTO OFF", 1,
+       _editAutoRun ? C_BLACK : C_WHITE);
 
   if (_editAutoRun) {
     gfx.setTextColor(C_WHITE);
@@ -408,7 +493,7 @@ void _drawEditScreen() {
   gfx.fillRect(0, NAV_Y, SCR_W, NAV_H, C_BG);
   _btn(20,          NAV_Y + 10, 160, 50, C_GRAY,  "CANCEL");
   _btn(320,         NAV_Y + 10, 160, 50, C_BLUE,  "SAVE");
-  _btn(SCR_W - 200, NAV_Y + 10, 180, 50, C_GREEN, "RUN NOW");
+  _btn(SCR_W - 200, NAV_Y + 10, 180, 50, C_GREEN, "RUN NOW", 2, C_BLACK);
   _drawStatusBar();
 }
 
@@ -432,13 +517,13 @@ void _handleEditTouch(int tx, int ty) {
   int sh   = NAV_Y - ED_SETT_Y;
   int sbty = sy + (sh - 26) / 2;
   if (_inRect(tx, ty, 15, sbty, 90, 26)) {
-    _editAutoRun = !_editAutoRun; needsRedraw = true; return;
+    _editAutoRun = !_editAutoRun; _drawEditSettings(); return;
   }
   if (_editAutoRun) {
-    if (_inRect(tx, ty, 175, sbty, 35, 26)) { _editHour = (_editHour + 23) % 24; needsRedraw = true; return; }
-    if (_inRect(tx, ty, 245, sbty, 35, 26)) { _editHour = (_editHour +  1) % 24; needsRedraw = true; return; }
-    if (_inRect(tx, ty, 300, sbty, 35, 26)) { _editMin  = (_editMin  + 55) % 60; needsRedraw = true; return; }
-    if (_inRect(tx, ty, 370, sbty, 35, 26)) { _editMin  = (_editMin  +  5) % 60; needsRedraw = true; return; }
+    if (_inRect(tx, ty, 175, sbty, 35, 26)) { _editHour = (_editHour + 23) % 24; _drawEditSettings(); return; }
+    if (_inRect(tx, ty, 245, sbty, 35, 26)) { _editHour = (_editHour +  1) % 24; _drawEditSettings(); return; }
+    if (_inRect(tx, ty, 300, sbty, 35, 26)) { _editMin  = (_editMin  + 55) % 60; _drawEditSettings(); return; }
+    if (_inRect(tx, ty, 370, sbty, 35, 26)) { _editMin  = (_editMin  +  5) % 60; _drawEditSettings(); return; }
   }
 
   // Zone rows
@@ -447,16 +532,101 @@ void _handleEditTouch(int tx, int ty) {
     int bty = y + (ED_ROW_H - 28) / 2;
     if (_inRect(tx, ty, ED_TOG_X, bty, ED_TOG_W, 28)) {
       _editZones[z].enabled = !_editZones[z].enabled;
-      needsRedraw = true; return;
+      _drawEditZoneRow(z); return;
     }
     if (_editZones[z].enabled) {
       if (_inRect(tx, ty, ED_DEC_X, bty, ED_DEC_W, 28)) {
         if (_editZones[z].durationMin > 1) _editZones[z].durationMin--;
-        needsRedraw = true; return;
+        _drawEditZoneRow(z); return;
       }
       if (_inRect(tx, ty, ED_INC_X, bty, ED_INC_W, 28)) {
         if (_editZones[z].durationMin < 99) _editZones[z].durationMin++;
-        needsRedraw = true; return;
+        _drawEditZoneRow(z); return;
+      }
+    }
+  }
+}
+
+// ── ZONE SETTINGS screen ───────────────────────────────────────────────────
+
+#define ZS_ROW_H   45
+#define ZS_TOG_X    15
+#define ZS_TOG_W    80
+#define ZS_DEC_X   390
+#define ZS_DEC_W    45
+#define ZS_VAL_X   440
+#define ZS_VAL_W    80
+#define ZS_INC_X   525
+#define ZS_INC_W    45
+
+void _drawZoneSettingsRow(int z) {
+  int y   = HDR_H + z * ZS_ROW_H;
+  int bty = y + (ZS_ROW_H - 28) / 2;
+  bool en = zoneEnabled[z];
+  gfx.fillRect(0, y, SCR_W, ZS_ROW_H, z % 2 == 0 ? C_ROW_A : C_ROW_B);
+
+  // Enable/disable toggle
+  _btn(ZS_TOG_X, bty, ZS_TOG_W, 28, en ? C_GREEN : C_GRAY, en ? "ON" : "OFF", 1, en ? C_BLACK : C_WHITE);
+
+  // Zone label
+  gfx.setTextColor(en ? C_WHITE : C_DIM);
+  gfx.setTextSize(2);
+  char lbl[8];
+  snprintf(lbl, sizeof(lbl), "Zone %d", z + 1);
+  gfx.setCursor(105, y + (ZS_ROW_H - 16) / 2);
+  gfx.print(lbl);
+
+  // Rate controls (dimmed when disabled)
+  if (en) {
+    _btn(ZS_DEC_X, bty, ZS_DEC_W, 28, C_GRAY, "-");
+    char rate[6];
+    formatRate(zoneRate[z], rate, sizeof(rate));
+    gfx.setTextColor(C_WHITE);
+    gfx.setTextSize(2);
+    int tw = strlen(rate) * 12;
+    gfx.setCursor(ZS_VAL_X + (ZS_VAL_W - tw) / 2, y + (ZS_ROW_H - 16) / 2);
+    gfx.print(rate);
+    _btn(ZS_INC_X, bty, ZS_INC_W, 28, C_GRAY, "+");
+    gfx.setTextColor(C_DIM);
+    gfx.setTextSize(1);
+    gfx.setCursor(ZS_INC_X + ZS_INC_W + 8, y + (ZS_ROW_H - 8) / 2);
+    gfx.print("in/hr");
+  } else {
+    gfx.setTextColor(C_DIM);
+    gfx.setTextSize(1);
+    gfx.setCursor(ZS_DEC_X, y + (ZS_ROW_H - 8) / 2);
+    gfx.print("disabled");
+  }
+}
+
+void _drawZoneSettingsScreen() {
+  gfx.fillScreen(C_BG);
+  _drawHeader("ZONE SETTINGS");
+  for (int z = 0; z < ZONE_COUNT; z++) _drawZoneSettingsRow(z);
+  gfx.fillRect(0, NAV_Y, SCR_W, NAV_H, C_BG);
+  _btn(20, NAV_Y + 10, 160, 50, C_GRAY, "BACK");
+  _drawStatusBar();
+}
+
+void _handleZoneSettingsTouch(int tx, int ty) {
+  if (_inRect(tx, ty, 20, NAV_Y + 10, 160, 50)) { currentScreen = SCR_HOME; needsRedraw = true; return; }
+
+  for (int z = 0; z < ZONE_COUNT; z++) {
+    int y   = HDR_H + z * ZS_ROW_H;
+    int bty = y + (ZS_ROW_H - 28) / 2;
+    if (_inRect(tx, ty, ZS_TOG_X, bty, ZS_TOG_W, 28)) {
+      zoneEnabled[z] = !zoneEnabled[z];
+      if (!zoneEnabled[z]) setZone(z, false);  // turn off immediately if disabled
+      _drawZoneSettingsRow(z); return;
+    }
+    if (zoneEnabled[z]) {
+      if (_inRect(tx, ty, ZS_DEC_X, bty, ZS_DEC_W, 28)) {
+        if (zoneRate[z] > 1) zoneRate[z]--;
+        _drawZoneSettingsRow(z); return;
+      }
+      if (_inRect(tx, ty, ZS_INC_X, bty, ZS_INC_W, 28)) {
+        if (zoneRate[z] < 50) zoneRate[z]++;
+        _drawZoneSettingsRow(z); return;
       }
     }
   }
@@ -468,9 +638,12 @@ void displayInit() {
   gfx.begin();
   gfx.setRotation(3);
   gfx.fillScreen(C_BG);
+  _backlight.begin();
+  _backlight.set(255);
   touch.begin();
   touch.onDetect(_onTouch);
-  needsRedraw = true;
+  needsRedraw     = true;
+  _lastActivityMs = millis();
 }
 
 // Show a full-screen status message during startup (before loop() runs).
@@ -491,18 +664,38 @@ void displayStatus(const char* line1, const char* line2 = nullptr) {
 }
 
 void displayLoop() {
-  // Trigger redraw when the clock minute changes or run state changes
-  String nowTime = ntpReady ? ntpFormattedTime().substring(0, 5) : "";
-  if (nowTime != _lastTime)            { _lastTime = nowTime; needsRedraw = true; }
-  if (runState.running != _lastRunning) { _lastRunning = runState.running; needsRedraw = true; }
+  // Apply a pending wake requested from the WiFi handler (deferred to avoid hardware conflicts)
+  if (_pendingWake) {
+    _pendingWake   = false;
+    _displayAsleep = false;
+    _backlight.set(255);
+    needsRedraw    = true;
+  }
 
+  // Full redraw only when changing screens or on first boot
   if (needsRedraw) {
     switch (currentScreen) {
-      case SCR_HOME:      _drawHomeScreen();      break;
-      case SCR_SCHEDULES: _drawSchedulesScreen(); break;
-      case SCR_EDIT:      _drawEditScreen();      break;
+      case SCR_HOME:          _drawHomeScreen();          break;
+      case SCR_SCHEDULES:     _drawSchedulesScreen();     break;
+      case SCR_EDIT:          _drawEditScreen();          break;
+      case SCR_ZONE_SETTINGS: _drawZoneSettingsScreen();  break;
     }
-    needsRedraw = false;
+    needsRedraw  = false;
+    _lastTime    = ntpReady ? ntpFormattedTime().substring(0, 5) : "";
+    _lastRunning = runState.running;
+  }
+
+  // Update the clock region in the header when the minute changes
+  String nowTime = ntpReady ? ntpFormattedTime().substring(0, 5) : "";
+  if (nowTime != _lastTime) {
+    _lastTime = nowTime;
+    _updateClockDisplay();
+  }
+
+  // Update the status bar when run state starts or stops
+  if (runState.running != _lastRunning) {
+    _lastRunning = runState.running;
+    _drawStatusBar();
   }
 
   // Refresh status bar every second while a schedule is running
@@ -511,18 +704,39 @@ void displayLoop() {
     if (millis() - _lastSts >= 1000) { _drawStatusBar(); _lastSts = millis(); }
   }
 
-  // Consume touch event — ignore taps within 350ms of the last one
+  // Finger-up detection: timestamp _contactSeen pulses here (safe millis context),
+  // then release _fingerDown if the IC has been quiet for 300ms.
+  static unsigned long _lastContactSeenMs = 0;
+  if (_contactSeen) {
+    _lastContactSeenMs = millis();
+    _contactSeen = false;
+  }
+  if (_fingerDown && millis() - _lastContactSeenMs > 150) {
+    _fingerDown = false;
+  }
+
+  // Consume touch event — ignore taps within 100ms of the last one
   static unsigned long _lastTouchMs = 0;
   if (_touched) {
     _touched = false;
-    if (millis() - _lastTouchMs > 350) {
-      _lastTouchMs = millis();
+    if (_displayAsleep) {
+      wakeDisplay();   // first tap only wakes; does not trigger an action
+    } else if (millis() - _lastTouchMs > 100) {
+      _lastTouchMs    = millis();
+      _lastActivityMs = millis();
       int tx = _touchX, ty = _touchY;
       switch (currentScreen) {
-        case SCR_HOME:      _handleHomeTouch(tx, ty);      break;
-        case SCR_SCHEDULES: _handleSchedulesTouch(tx, ty); break;
-        case SCR_EDIT:      _handleEditTouch(tx, ty);      break;
+        case SCR_HOME:          _handleHomeTouch(tx, ty);          break;
+        case SCR_SCHEDULES:     _handleSchedulesTouch(tx, ty);     break;
+        case SCR_EDIT:          _handleEditTouch(tx, ty);          break;
+        case SCR_ZONE_SETTINGS: _handleZoneSettingsTouch(tx, ty);  break;
       }
     }
+  }
+
+  // Sleep the backlight after SLEEP_TIMEOUT_SEC of inactivity (0 = never)
+  if (!_displayAsleep && SLEEP_TIMEOUT_SEC > 0 &&
+      millis() - _lastActivityMs > (unsigned long)SLEEP_TIMEOUT_SEC * 1000UL) {
+    _sleepDisplay();
   }
 }
