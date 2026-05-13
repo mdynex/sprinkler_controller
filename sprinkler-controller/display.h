@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino_GigaDisplay_GFX.h>
 #include <Arduino_GigaDisplayTouch.h>
+#include <Arduino_GigaDisplay.h>
 #include "zones.h"
 #include "schedules.h"
 #include "ntp.h"
@@ -54,13 +55,16 @@
 // ── Global objects ─────────────────────────────────────────────────────────
 GigaDisplay_GFX          gfx;
 Arduino_GigaDisplayTouch touch;
+GigaDisplayBacklight     _backlight;
 
 // ── Screen state ───────────────────────────────────────────────────────────
 enum Screen { SCR_HOME, SCR_SCHEDULES, SCR_EDIT, SCR_ZONE_SETTINGS };
-Screen currentScreen = SCR_HOME;
-bool   needsRedraw   = true;
-String _lastTime     = "";
-bool   _lastRunning  = false;
+Screen        currentScreen   = SCR_HOME;
+bool          needsRedraw     = true;
+String        _lastTime       = "";
+bool          _lastRunning    = false;
+bool          _displayAsleep  = false;
+unsigned long _lastActivityMs = 0;
 
 // Touch event — set by callback, consumed in displayLoop()
 volatile bool _touched     = false;
@@ -127,6 +131,22 @@ void _saveEditState() {
     if (s.stepCount >= MAX_ZONE_STEPS) break;
     s.steps[s.stepCount++] = {z + 1, _editZones[z].durationMin * 60};
   }
+}
+
+// ── Sleep / wake ───────────────────────────────────────────────────────────
+
+void wakeDisplay() {
+  _lastActivityMs = millis();
+  if (_displayAsleep) {
+    _backlight.set(255);
+    _displayAsleep = false;
+    needsRedraw    = true;
+  }
+}
+
+void _sleepDisplay() {
+  _backlight.set(0);
+  _displayAsleep = true;
 }
 
 // ── Drawing utilities ──────────────────────────────────────────────────────
@@ -619,9 +639,12 @@ void displayInit() {
   gfx.begin();
   gfx.setRotation(3);
   gfx.fillScreen(C_BG);
+  _backlight.begin();
+  _backlight.set(255);
   touch.begin();
   touch.onDetect(_onTouch);
-  needsRedraw = true;
+  needsRedraw     = true;
+  _lastActivityMs = millis();
 }
 
 // Show a full-screen status message during startup (before loop() runs).
@@ -689,8 +712,11 @@ void displayLoop() {
   static unsigned long _lastTouchMs = 0;
   if (_touched) {
     _touched = false;
-    if (millis() - _lastTouchMs > 100) {
-      _lastTouchMs = millis();
+    if (_displayAsleep) {
+      wakeDisplay();   // first tap only wakes; does not trigger an action
+    } else if (millis() - _lastTouchMs > 100) {
+      _lastTouchMs    = millis();
+      _lastActivityMs = millis();
       int tx = _touchX, ty = _touchY;
       switch (currentScreen) {
         case SCR_HOME:          _handleHomeTouch(tx, ty);          break;
@@ -699,5 +725,11 @@ void displayLoop() {
         case SCR_ZONE_SETTINGS: _handleZoneSettingsTouch(tx, ty);  break;
       }
     }
+  }
+
+  // Sleep the backlight after SLEEP_TIMEOUT_SEC of inactivity (0 = never)
+  if (!_displayAsleep && SLEEP_TIMEOUT_SEC > 0 &&
+      millis() - _lastActivityMs > (unsigned long)SLEEP_TIMEOUT_SEC * 1000UL) {
+    _sleepDisplay();
   }
 }

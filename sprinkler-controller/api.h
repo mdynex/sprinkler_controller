@@ -4,7 +4,8 @@
 #include "schedules.h"
 #include "ntp.h"
 
-extern bool needsRedraw;  // defined in display.h — set true to trigger full screen refresh
+extern bool needsRedraw;   // defined in display.h — set true to trigger full screen refresh
+extern void wakeDisplay(); // defined in display.h — wakes backlight and resets sleep timer
 
 // =============================================================================
 // api.h — REST API route handlers
@@ -59,6 +60,7 @@ void routeZoneControl(WiFiClient& client, HttpRequest& req) {
   }
   setZone(id, action == "on");
   needsRedraw = true;
+  wakeDisplay();
   sendResponse(client, 200,
     "{\"id\":" + String(id + 1) + ",\"state\":\"" + action + "\"}");
 }
@@ -72,6 +74,7 @@ void routeRunSchedule(WiFiClient& client, const String& path) {
 
   startSchedule(idx);
   needsRedraw = true;
+  wakeDisplay();
   sendResponse(client, 200,
     "{\"started\":true,\"schedule_id\":" + String(schedules[idx].id) + "}");
 }
@@ -107,6 +110,7 @@ void handleApi(WiFiClient& client, HttpRequest& req) {
       zoneEnabled[id] = doc["enabled"].as<bool>();
       if (!zoneEnabled[id]) setZone(id, false);  // turn off immediately if disabled
       needsRedraw = true;
+      wakeDisplay();
     }
     if (doc.containsKey("rate")) {
       int tenths = (int)round(doc["rate"].as<float>() * 10.0f);
@@ -180,6 +184,7 @@ void handleApi(WiFiClient& client, HttpRequest& req) {
   } else if (m == "POST" && p == "/schedules/stop") {
     stopSchedule();
     needsRedraw = true;
+    wakeDisplay();
     sendResponse(client, 200, "{\"stopped\":true}");
 
   } else {

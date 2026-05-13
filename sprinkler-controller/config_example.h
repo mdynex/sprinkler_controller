@@ -32,3 +32,8 @@ const int ZONE_PINS[ZONE_COUNT] = {2, 3, 4, 5, 6, 7, 8, 9};
 // ── Schedules ──────────────────────────────────────────────────────────────
 const int MAX_SCHEDULES  = 8;
 const int MAX_ZONE_STEPS = 8;
+
+// ── Display ─────────────────────────────────────────────────────────────────
+// Seconds of inactivity before the screen backlight turns off.
+// Set to 0 to disable sleep entirely.
+const int SLEEP_TIMEOUT_SEC = 60;
