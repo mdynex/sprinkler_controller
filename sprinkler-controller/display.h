@@ -64,6 +64,7 @@ bool          needsRedraw     = true;
 String        _lastTime       = "";
 bool          _lastRunning    = false;
 bool          _displayAsleep  = false;
+bool          _pendingWake    = false;
 unsigned long _lastActivityMs = 0;
 
 // Touch event — set by callback, consumed in displayLoop()
@@ -135,13 +136,11 @@ void _saveEditState() {
 
 // ── Sleep / wake ───────────────────────────────────────────────────────────
 
+// Safe to call from anywhere (including WiFi request handlers).
+// Actual backlight/redraw happens in displayLoop() to avoid hardware conflicts.
 void wakeDisplay() {
   _lastActivityMs = millis();
-  if (_displayAsleep) {
-    _backlight.set(255);
-    _displayAsleep = false;
-    needsRedraw    = true;
-  }
+  if (_displayAsleep) _pendingWake = true;
 }
 
 void _sleepDisplay() {
@@ -665,6 +664,14 @@ void displayStatus(const char* line1, const char* line2 = nullptr) {
 }
 
 void displayLoop() {
+  // Apply a pending wake requested from the WiFi handler (deferred to avoid hardware conflicts)
+  if (_pendingWake) {
+    _pendingWake   = false;
+    _displayAsleep = false;
+    _backlight.set(255);
+    needsRedraw    = true;
+  }
+
   // Full redraw only when changing screens or on first boot
   if (needsRedraw) {
     switch (currentScreen) {
