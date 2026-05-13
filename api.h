@@ -4,6 +4,8 @@
 #include "schedules.h"
 #include "ntp.h"
 
+extern bool needsRedraw;  // defined in display.h — set true to trigger full screen refresh
+
 // =============================================================================
 // api.h — REST API route handlers
 //
@@ -56,6 +58,7 @@ void routeZoneControl(WiFiClient& client, HttpRequest& req) {
     sendResponse(client, 400, "{\"error\":\"action must be on or off\"}"); return;
   }
   setZone(id, action == "on");
+  needsRedraw = true;
   sendResponse(client, 200,
     "{\"id\":" + String(id + 1) + ",\"state\":\"" + action + "\"}");
 }
@@ -68,6 +71,7 @@ void routeRunSchedule(WiFiClient& client, const String& path) {
   if (idx < 0) { sendResponse(client, 404, "{\"error\":\"schedule not found\"}"); return; }
 
   startSchedule(idx);
+  needsRedraw = true;
   sendResponse(client, 200,
     "{\"started\":true,\"schedule_id\":" + String(schedules[idx].id) + "}");
 }
@@ -102,6 +106,7 @@ void handleApi(WiFiClient& client, HttpRequest& req) {
     if (doc.containsKey("enabled")) {
       zoneEnabled[id] = doc["enabled"].as<bool>();
       if (!zoneEnabled[id]) setZone(id, false);  // turn off immediately if disabled
+      needsRedraw = true;
     }
     if (doc.containsKey("rate")) {
       int tenths = (int)round(doc["rate"].as<float>() * 10.0f);
@@ -174,6 +179,7 @@ void handleApi(WiFiClient& client, HttpRequest& req) {
   // POST /schedules/stop — stop whatever is currently running
   } else if (m == "POST" && p == "/schedules/stop") {
     stopSchedule();
+    needsRedraw = true;
     sendResponse(client, 200, "{\"stopped\":true}");
 
   } else {
