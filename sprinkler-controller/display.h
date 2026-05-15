@@ -103,6 +103,10 @@ int      _editHour    = 6;
 int      _editMin     = 0;
 EditZone _editZones[ZONE_COUNT];
 
+// ── Zone Settings paging ───────────────────────────────────────────────────
+#define ZS_ZONES_PER_PAGE  4
+int _zoneSettingsPage = 0;   // 0 = zones 1-4, 1 = zones 5-8, etc.
+
 void _loadEditState(int schedIdx) {
   _editIdx     = schedIdx;
   Schedule& s  = schedules[schedIdx];
@@ -559,74 +563,104 @@ void _handleEditTouch(int tx, int ty) {
 #define ZS_INC_X   525
 #define ZS_INC_W    45
 
-void _drawZoneSettingsRow(int z) {
-  int y   = HDR_H + z * ZS_ROW_H;
-  int bty = y + (ZS_ROW_H - 28) / 2;
-  bool en = zoneEnabled[z];
-  gfx.fillRect(0, y, SCR_W, ZS_ROW_H, z % 2 == 0 ? C_ROW_A : C_ROW_B);
-
-  // Enable/disable toggle
-  _btn(ZS_TOG_X, bty, ZS_TOG_W, 28, en ? C_GREEN : C_GRAY, en ? "ON" : "OFF", 1, en ? C_BLACK : C_WHITE);
-
-  // Zone label
-  gfx.setTextColor(en ? C_WHITE : C_DIM);
-  gfx.setTextSize(2);
-  char lbl[8];
-  snprintf(lbl, sizeof(lbl), "Zone %d", z + 1);
-  gfx.setCursor(105, y + (ZS_ROW_H - 16) / 2);
-  gfx.print(lbl);
-
-  // Rate controls (dimmed when disabled)
-  if (en) {
-    _btn(ZS_DEC_X, bty, ZS_DEC_W, 28, C_GRAY, "-");
-    char rate[6];
-    formatRate(zoneRate[z], rate, sizeof(rate));
-    gfx.setTextColor(C_WHITE);
-    gfx.setTextSize(2);
-    int tw = strlen(rate) * 12;
-    gfx.setCursor(ZS_VAL_X + (ZS_VAL_W - tw) / 2, y + (ZS_ROW_H - 16) / 2);
-    gfx.print(rate);
-    _btn(ZS_INC_X, bty, ZS_INC_W, 28, C_GRAY, "+");
-    gfx.setTextColor(C_DIM);
-    gfx.setTextSize(1);
-    gfx.setCursor(ZS_INC_X + ZS_INC_W + 8, y + (ZS_ROW_H - 8) / 2);
-    gfx.print("in/hr");
-  } else {
-    gfx.setTextColor(C_DIM);
-    gfx.setTextSize(1);
-    gfx.setCursor(ZS_DEC_X, y + (ZS_ROW_H - 8) / 2);
-    gfx.print("disabled");
-  }
-}
 
 void _drawZoneSettingsScreen() {
   gfx.fillScreen(C_BG);
-  _drawHeader("ZONE SETTINGS");
-  for (int z = 0; z < ZONE_COUNT; z++) _drawZoneSettingsRow(z);
+
+  // Page indicator in header title
+  int maxPage = (ZONE_COUNT - 1) / ZS_ZONES_PER_PAGE;
+  char title[32];
+  snprintf(title, sizeof(title), "ZONE SETTINGS (%d/%d)", _zoneSettingsPage + 1, maxPage + 1);
+  _drawHeader(title);
+
+  // Draw only the zones on this page
+  int zStart = _zoneSettingsPage * ZS_ZONES_PER_PAGE;
+  int zEnd   = min(zStart + ZS_ZONES_PER_PAGE, ZONE_COUNT);
+  for (int z = zStart; z < zEnd; z++) {
+    // Re-map to screen row 0-3 so rows always start at the top
+    int screenRow = z - zStart;
+    int y   = HDR_H + screenRow * ZS_ROW_H;
+    int bty = y + (ZS_ROW_H - 28) / 2;
+    bool en = zoneEnabled[z];
+    gfx.fillRect(0, y, SCR_W, ZS_ROW_H, screenRow % 2 == 0 ? C_ROW_A : C_ROW_B);
+
+    _btn(ZS_TOG_X, bty, ZS_TOG_W, 28, en ? C_GREEN : C_GRAY, en ? "ON" : "OFF", 1, en ? C_BLACK : C_WHITE);
+
+    gfx.setTextColor(en ? C_WHITE : C_DIM);
+    gfx.setTextSize(2);
+    char lbl[8];
+    snprintf(lbl, sizeof(lbl), "Zone %d", z + 1);
+    gfx.setCursor(105, y + (ZS_ROW_H - 16) / 2);
+    gfx.print(lbl);
+
+    if (en) {
+      _btn(ZS_DEC_X, bty, ZS_DEC_W, 28, C_GRAY, "-");
+      char rate[6];
+      formatRate(zoneRate[z], rate, sizeof(rate));
+      gfx.setTextColor(C_WHITE);
+      gfx.setTextSize(2);
+      int tw = strlen(rate) * 12;
+      gfx.setCursor(ZS_VAL_X + (ZS_VAL_W - tw) / 2, y + (ZS_ROW_H - 16) / 2);
+      gfx.print(rate);
+      _btn(ZS_INC_X, bty, ZS_INC_W, 28, C_GRAY, "+");
+      gfx.setTextColor(C_DIM);
+      gfx.setTextSize(1);
+      gfx.setCursor(ZS_INC_X + ZS_INC_W + 8, y + (ZS_ROW_H - 8) / 2);
+      gfx.print("in/hr");
+    } else {
+      gfx.setTextColor(C_DIM);
+      gfx.setTextSize(1);
+      gfx.setCursor(ZS_DEC_X, y + (ZS_ROW_H - 8) / 2);
+      gfx.print("disabled");
+    }
+  }
+
+  // Nav bar: BACK | PREV | NEXT
   gfx.fillRect(0, NAV_Y, SCR_W, NAV_H, C_BG);
   _btn(20, NAV_Y + 10, 160, 50, C_GRAY, "BACK");
+  if (_zoneSettingsPage > 0)
+    _btn(490, NAV_Y + 10, 130, 50, C_GRAY, "< PREV");
+  if (_zoneSettingsPage < maxPage)
+    _btn(640, NAV_Y + 10, 130, 50, C_GRAY, "NEXT >");
+
   _drawStatusBar();
 }
 
 void _handleZoneSettingsTouch(int tx, int ty) {
-  if (_inRect(tx, ty, 20, NAV_Y + 10, 160, 50)) { currentScreen = SCR_HOME; needsRedraw = true; return; }
+  int maxPage = (ZONE_COUNT - 1) / ZS_ZONES_PER_PAGE;
 
-  for (int z = 0; z < ZONE_COUNT; z++) {
-    int y   = HDR_H + z * ZS_ROW_H;
+  // Nav buttons
+  if (_inRect(tx, ty, 20, NAV_Y + 10, 160, 50)) {
+    _zoneSettingsPage = 0;   // reset to first page on exit
+    currentScreen = SCR_HOME; needsRedraw = true; return;
+  }
+  if (_zoneSettingsPage > 0 && _inRect(tx, ty, 490, NAV_Y + 10, 130, 50)) {
+    _zoneSettingsPage--; needsRedraw = true; return;
+  }
+  if (_zoneSettingsPage < maxPage && _inRect(tx, ty, 640, NAV_Y + 10, 130, 50)) {
+    _zoneSettingsPage++; needsRedraw = true; return;
+  }
+
+  // Zone rows — only check zones on the current page
+  int zStart = _zoneSettingsPage * ZS_ZONES_PER_PAGE;
+  int zEnd   = min(zStart + ZS_ZONES_PER_PAGE, ZONE_COUNT);
+  for (int z = zStart; z < zEnd; z++) {
+    int screenRow = z - zStart;
+    int y   = HDR_H + screenRow * ZS_ROW_H;
     int bty = y + (ZS_ROW_H - 28) / 2;
     if (_inRect(tx, ty, ZS_TOG_X, bty, ZS_TOG_W, 28)) {
       zoneEnabled[z] = !zoneEnabled[z];
-      if (!zoneEnabled[z]) setZone(z, false);  // turn off immediately if disabled
-      _drawZoneSettingsRow(z); return;
+      if (!zoneEnabled[z]) setZone(z, false);
+      needsRedraw = true; return;
     }
     if (zoneEnabled[z]) {
       if (_inRect(tx, ty, ZS_DEC_X, bty, ZS_DEC_W, 28)) {
         if (zoneRate[z] > 1) zoneRate[z]--;
-        _drawZoneSettingsRow(z); return;
+        needsRedraw = true; return;
       }
       if (_inRect(tx, ty, ZS_INC_X, bty, ZS_INC_W, 28)) {
         if (zoneRate[z] < 50) zoneRate[z]++;
-        _drawZoneSettingsRow(z); return;
+        needsRedraw = true; return;
       }
     }
   }
