@@ -97,7 +97,6 @@ struct EditZone {
   int  durationMin;   // 1–99 minutes
 };
 
-int      _editIdx     = -1;
 bool     _editAutoRun = false;
 int      _editHour    = 6;
 int      _editMin     = 0;
@@ -107,34 +106,31 @@ EditZone _editZones[ZONE_COUNT];
 #define ZS_ZONES_PER_PAGE  4
 int _zoneSettingsPage = 0;   // 0 = zones 1-4, 1 = zones 5-8, etc.
 
-void _loadEditState(int schedIdx) {
-  _editIdx     = schedIdx;
-  Schedule& s  = schedules[schedIdx];
-  _editAutoRun = s.autoRun;
-  _editHour    = s.runHour;
-  _editMin     = s.runMinute;
+void _loadEditState() {
+  _editAutoRun = theSchedule.autoRun;
+  _editHour    = theSchedule.runHour;
+  _editMin     = theSchedule.runMinute;
   for (int z = 0; z < ZONE_COUNT; z++) {
     _editZones[z] = {false, 5};
   }
-  for (int st = 0; st < s.stepCount; st++) {
-    int z = s.steps[st].zoneId - 1;
+  for (int st = 0; st < theSchedule.stepCount; st++) {
+    int z = theSchedule.steps[st].zoneId - 1;
     if (z >= 0 && z < ZONE_COUNT) {
       _editZones[z].enabled     = true;
-      _editZones[z].durationMin = max(1, s.steps[st].duration / 60);
+      _editZones[z].durationMin = max(1, theSchedule.steps[st].duration / 60);
     }
   }
 }
 
 void _saveEditState() {
-  Schedule& s  = schedules[_editIdx];
-  s.autoRun    = _editAutoRun;
-  s.runHour    = _editHour;
-  s.runMinute  = _editMin;
-  s.stepCount  = 0;
+  theSchedule.autoRun   = _editAutoRun;
+  theSchedule.runHour   = _editHour;
+  theSchedule.runMinute = _editMin;
+  theSchedule.stepCount = 0;
   for (int z = 0; z < ZONE_COUNT; z++) {
     if (!_editZones[z].enabled) continue;
-    if (s.stepCount >= MAX_ZONE_STEPS) break;
-    s.steps[s.stepCount++] = {z + 1, _editZones[z].durationMin * 60};
+    if (theSchedule.stepCount >= SCHEDULE_MAX_STEPS) break;
+    theSchedule.steps[theSchedule.stepCount++] = {z + 1, _editZones[z].durationMin * 60};
   }
 }
 
@@ -204,18 +200,17 @@ void _drawStatusBar() {
   gfx.setTextSize(1);
   gfx.setCursor(10, STS_Y + 14);
   if (runState.running) {
-    Schedule& s    = schedules[runState.scheduleIndex];
-    ZoneStep& step = s.steps[runState.stepIndex];
+    ZoneStep& step = theSchedule.steps[runState.stepIndex];
     unsigned long elapsed   = (millis() - runState.stepStart) / 1000UL;
     unsigned long remaining = step.duration > (int)elapsed ? step.duration - elapsed : 0;
     gfx.print("Running: ");
-    gfx.print(s.name);
+    gfx.print(theSchedule.name);
     gfx.print("  |  Zone ");
     gfx.print(step.zoneId);
     gfx.print("  |  Step ");
     gfx.print(runState.stepIndex + 1);
     gfx.print("/");
-    gfx.print(s.stepCount);
+    gfx.print(theSchedule.stepCount);
     gfx.print("  |  ");
     gfx.print(remaining);
     gfx.print("s remaining");
@@ -304,23 +299,22 @@ void _handleHomeTouch(int tx, int ty) {
 #define SL_LIST_Y   (HDR_H + 5)
 #define SL_RUN_X    (SCR_W - 140)
 
-void _drawSchedRow(int screenRow, int si) {
-  Schedule& s  = schedules[si];
+void _drawSchedRow(int screenRow) {
   int y = SL_LIST_Y + screenRow * (SL_ROW_H + SL_ROW_GAP);
-  bool active = runState.running && runState.scheduleIndex == si;
+  bool active = runState.running;
   gfx.fillRoundRect(10, y, SCR_W - 20, SL_ROW_H, 6, active ? 0x0343 : C_DARKGRAY);
 
   gfx.setTextColor(C_WHITE);
   gfx.setTextSize(2);
   gfx.setCursor(20, y + 10);
-  gfx.print(s.name);
+  gfx.print(theSchedule.name);
 
   gfx.setTextSize(1);
-  gfx.setTextColor(s.autoRun ? C_ORANGE : C_DIM);
+  gfx.setTextColor(theSchedule.autoRun ? C_ORANGE : C_DIM);
   gfx.setCursor(20, y + 36);
-  if (s.autoRun) {
+  if (theSchedule.autoRun) {
     char buf[12];
-    snprintf(buf, sizeof(buf), "Daily %02d:%02d", s.runHour, s.runMinute);
+    snprintf(buf, sizeof(buf), "Daily %02d:%02d", theSchedule.runHour, theSchedule.runMinute);
     gfx.print(buf);
   } else {
     gfx.print("Manual only");
@@ -328,7 +322,7 @@ void _drawSchedRow(int screenRow, int si) {
 
   gfx.setTextColor(C_DIM);
   gfx.setCursor(270, y + 22);
-  gfx.print(s.stepCount);
+  gfx.print(theSchedule.stepCount);
   gfx.print(" zones");
 
   _btn(SL_RUN_X, y + 9, 120, SL_ROW_H - 18,
@@ -340,18 +334,15 @@ void _drawSchedRow(int screenRow, int si) {
 void _drawSchedulesScreen() {
   gfx.fillScreen(C_BG);
   _drawHeader("SCHEDULES");
-  int row = 0;
-  for (int i = 0; i < MAX_SCHEDULES && row < 5; i++) {
-    if (!schedules[i].used) continue;
-    _drawSchedRow(row++, i);
-  }
-  if (row == 0) {
+  if (theSchedule.used) {
+    _drawSchedRow(0);
+  } else {
     gfx.setTextColor(C_DIM);
     gfx.setTextSize(2);
     gfx.setCursor(20, HDR_H + 40);
-    gfx.print("No schedules yet.");
+    gfx.print("No schedule yet.");
     gfx.setCursor(20, HDR_H + 70);
-    gfx.print("Create one via the API, then tap it here to configure.");
+    gfx.print("Send one from the app, then tap it here to configure.");
   }
   gfx.fillRect(0, NAV_Y, SCR_W, NAV_H, C_BG);
   _btn(20,          NAV_Y + 10, 160, 50, C_GRAY, "BACK");
@@ -360,41 +351,32 @@ void _drawSchedulesScreen() {
 }
 
 void _handleSchedulesTouch(int tx, int ty) {
-  if (_inRect(tx, ty, 20, NAV_Y + 10, 160, 50))          { currentScreen = SCR_HOME; needsRedraw = true; return; }
+  if (_inRect(tx, ty, 20, NAV_Y + 10, 160, 50)) { currentScreen = SCR_HOME; needsRedraw = true; return; }
+
+  // STOP ALL button
   if (_inRect(tx, ty, SCR_W - 250, NAV_Y + 10, 230, 50)) {
-    // Stop the running schedule; redraw only the row that changed + status bar
-    int prevIdx = runState.scheduleIndex;
     stopSchedule();
-    int row = 0;
-    for (int i = 0; i < MAX_SCHEDULES && row < 5; i++) {
-      if (!schedules[i].used) continue;
-      if (i == prevIdx) { _drawSchedRow(row, i); break; }
-      row++;
-    }
+    if (theSchedule.used) _drawSchedRow(0);
     _drawStatusBar();
     return;
   }
 
-  int row = 0;
-  for (int i = 0; i < MAX_SCHEDULES && row < 5; i++) {
-    if (!schedules[i].used) continue;
-    int y = SL_LIST_Y + row * (SL_ROW_H + SL_ROW_GAP);
-    // Run/Stop button — redraw just that row + status bar
-    if (_inRect(tx, ty, SL_RUN_X, y + 9, 120, SL_ROW_H - 18)) {
-      if (runState.running && runState.scheduleIndex == i) stopSchedule();
-      else startSchedule(i);
-      _drawSchedRow(row, i);
-      _drawStatusBar();
-      return;
-    }
-    // Row body → edit screen (full redraw needed for new screen)
-    if (_inRect(tx, ty, 10, y, SCR_W - 20, SL_ROW_H)) {
-      _loadEditState(i);
-      currentScreen = SCR_EDIT;
-      needsRedraw = true;
-      return;
-    }
-    row++;
+  if (!theSchedule.used) return;
+  int y = SL_LIST_Y;
+
+  // Run/Stop button — redraw just the row + status bar
+  if (_inRect(tx, ty, SL_RUN_X, y + 9, 120, SL_ROW_H - 18)) {
+    if (runState.running) stopSchedule();
+    else startSchedule();
+    _drawSchedRow(0);
+    _drawStatusBar();
+    return;
+  }
+  // Row body → edit screen
+  if (_inRect(tx, ty, 10, y, SCR_W - 20, SL_ROW_H)) {
+    _loadEditState();
+    currentScreen = SCR_EDIT;
+    needsRedraw = true;
   }
 }
 
@@ -488,7 +470,7 @@ void _drawEditSettings() {
 void _drawEditScreen() {
   gfx.fillScreen(C_BG);
   char title[48];
-  snprintf(title, sizeof(title), "EDIT: %s", schedules[_editIdx].name);
+  snprintf(title, sizeof(title), "EDIT: %s", theSchedule.name);
   _drawHeader(title);
 
   for (int z = 0; z < ZONE_COUNT; z++) _drawEditZoneRow(z);
@@ -512,7 +494,7 @@ void _handleEditTouch(int tx, int ty) {
   }
   if (_inRect(tx, ty, SCR_W - 200, NAV_Y + 10, 180, 50)) {
     _saveEditState();
-    startSchedule(_editIdx);
+    startSchedule();
     currentScreen = SCR_HOME; needsRedraw = true; return;
   }
 
