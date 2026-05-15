@@ -553,15 +553,16 @@ void _handleEditTouch(int tx, int ty) {
 
 // ── ZONE SETTINGS screen ───────────────────────────────────────────────────
 
-#define ZS_ROW_H   45
+#define ZS_ROW_H   75   // 4 rows × 75 = 300px, fits in the 320px content area
+#define ZS_BTN_H   44   // button height inside each row
 #define ZS_TOG_X    15
-#define ZS_TOG_W    80
+#define ZS_TOG_W    90
 #define ZS_DEC_X   390
-#define ZS_DEC_W    45
-#define ZS_VAL_X   440
+#define ZS_DEC_W    50
+#define ZS_VAL_X   445
 #define ZS_VAL_W    80
-#define ZS_INC_X   525
-#define ZS_INC_W    45
+#define ZS_INC_X   530
+#define ZS_INC_W    50
 
 
 void _drawZoneSettingsScreen() {
@@ -580,21 +581,21 @@ void _drawZoneSettingsScreen() {
     // Re-map to screen row 0-3 so rows always start at the top
     int screenRow = z - zStart;
     int y   = HDR_H + screenRow * ZS_ROW_H;
-    int bty = y + (ZS_ROW_H - 28) / 2;
+    int bty = y + (ZS_ROW_H - ZS_BTN_H) / 2;
     bool en = zoneEnabled[z];
     gfx.fillRect(0, y, SCR_W, ZS_ROW_H, screenRow % 2 == 0 ? C_ROW_A : C_ROW_B);
 
-    _btn(ZS_TOG_X, bty, ZS_TOG_W, 28, en ? C_GREEN : C_GRAY, en ? "ON" : "OFF", 1, en ? C_BLACK : C_WHITE);
+    _btn(ZS_TOG_X, bty, ZS_TOG_W, ZS_BTN_H, en ? C_GREEN : C_GRAY, en ? "ON" : "OFF", 2, en ? C_BLACK : C_WHITE);
 
     gfx.setTextColor(en ? C_WHITE : C_DIM);
-    gfx.setTextSize(2);
+    gfx.setTextSize(3);
     char lbl[8];
     snprintf(lbl, sizeof(lbl), "Zone %d", z + 1);
-    gfx.setCursor(105, y + (ZS_ROW_H - 16) / 2);
+    gfx.setCursor(115, y + (ZS_ROW_H - 24) / 2);
     gfx.print(lbl);
 
     if (en) {
-      _btn(ZS_DEC_X, bty, ZS_DEC_W, 28, C_GRAY, "-");
+      _btn(ZS_DEC_X, bty, ZS_DEC_W, ZS_BTN_H, C_GRAY, "-", 2);
       char rate[6];
       formatRate(zoneRate[z], rate, sizeof(rate));
       gfx.setTextColor(C_WHITE);
@@ -602,7 +603,7 @@ void _drawZoneSettingsScreen() {
       int tw = strlen(rate) * 12;
       gfx.setCursor(ZS_VAL_X + (ZS_VAL_W - tw) / 2, y + (ZS_ROW_H - 16) / 2);
       gfx.print(rate);
-      _btn(ZS_INC_X, bty, ZS_INC_W, 28, C_GRAY, "+");
+      _btn(ZS_INC_X, bty, ZS_INC_W, ZS_BTN_H, C_GRAY, "+", 2);
       gfx.setTextColor(C_DIM);
       gfx.setTextSize(1);
       gfx.setCursor(ZS_INC_X + ZS_INC_W + 8, y + (ZS_ROW_H - 8) / 2);
@@ -647,18 +648,18 @@ void _handleZoneSettingsTouch(int tx, int ty) {
   for (int z = zStart; z < zEnd; z++) {
     int screenRow = z - zStart;
     int y   = HDR_H + screenRow * ZS_ROW_H;
-    int bty = y + (ZS_ROW_H - 28) / 2;
-    if (_inRect(tx, ty, ZS_TOG_X, bty, ZS_TOG_W, 28)) {
+    int bty = y + (ZS_ROW_H - ZS_BTN_H) / 2;
+    if (_inRect(tx, ty, ZS_TOG_X, bty, ZS_TOG_W, ZS_BTN_H)) {
       zoneEnabled[z] = !zoneEnabled[z];
       if (!zoneEnabled[z]) setZone(z, false);
       needsRedraw = true; return;
     }
     if (zoneEnabled[z]) {
-      if (_inRect(tx, ty, ZS_DEC_X, bty, ZS_DEC_W, 28)) {
+      if (_inRect(tx, ty, ZS_DEC_X, bty, ZS_DEC_W, ZS_BTN_H)) {
         if (zoneRate[z] > 1) zoneRate[z]--;
         needsRedraw = true; return;
       }
-      if (_inRect(tx, ty, ZS_INC_X, bty, ZS_INC_W, 28)) {
+      if (_inRect(tx, ty, ZS_INC_X, bty, ZS_INC_W, ZS_BTN_H)) {
         if (zoneRate[z] < 50) zoneRate[z]++;
         needsRedraw = true; return;
       }
