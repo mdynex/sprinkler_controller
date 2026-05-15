@@ -29,12 +29,6 @@ const long UTC_OFFSET_SECONDS = -21600;
 const int ZONE_COUNT = 8;
 const int ZONE_PINS[ZONE_COUNT] = {2, 3, 4, 5, 6, 7, 8, 9};
 
-// ── Schedules ──────────────────────────────────────────────────────────────
-const int MAX_SCHEDULES  = 8;
-// MAX_ZONE_STEPS must fit the round-robin cycle-and-soak expansion:
-//   worst case = ZONE_COUNT × max_cycles_per_zone  (e.g. 8 zones × 8 cycles = 64)
-const int MAX_ZONE_STEPS = 64;
-
 // ── Display ─────────────────────────────────────────────────────────────────
 // Seconds of inactivity before the screen backlight turns off.
 // Set to 0 to disable sleep entirely.

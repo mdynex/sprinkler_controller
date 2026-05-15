@@ -5,90 +5,74 @@
 #include "ntp.h"
 
 // =============================================================================
-// schedules.h — Schedule storage, JSON serialization, and runner
+// schedules.h — Single-schedule storage, JSON serialization, and runner
 //
-// A Schedule is an ordered list of zone steps. Each step specifies which
-// zone to water and for how long. When a schedule runs, zones activate one
-// at a time in step order — the next zone doesn't start until the current
-// one's duration has elapsed.
+// Only one schedule lives in memory at a time. Sending a new schedule via
+// POST /schedules replaces whatever was stored before.
 //
 // The runner is non-blocking: scheduleTick() is called every loop() and
 // simply checks millis() to see if it's time to advance to the next step.
 // This means the WiFi server and display remain responsive while watering.
 //
-// Schedules are stored in RAM only. They are lost when the board powers off.
-// Use the API to recreate them, or add EEPROM/SD persistence later.
+// Schedules are stored in RAM only — they are lost when the board powers off.
 //
-// Auto-run: each schedule can be given a daily run time (hour + minute).
-// schedulerCheck() runs every 30 seconds and fires any schedule whose time
-// matches the current local time, as long as it hasn't run in the last 23h.
+// Auto-run: the schedule can be given a daily run time (hour + minute).
+// schedulerCheck() runs every 30 seconds and fires the schedule if its time
+// matches the current local time and it hasn't run in the last 23 hours.
 // =============================================================================
+
+// Maximum zone steps per schedule. Internal implementation detail only —
+// not a user-facing config. 128 covers 8 zones × 16 soak cycles with room
+// to spare.
+#define SCHEDULE_MAX_STEPS 128
 
 // ── Data structures ────────────────────────────────────────────────────────
 
 // One step in a schedule: a zone number and how long to run it.
 struct ZoneStep {
-  int zoneId;    // 1-based zone number (matches the number shown on the display)
+  int zoneId;    // 1-based zone number
   int duration;  // seconds to keep this zone open
 };
 
-// A complete schedule stored in memory.
+// The single schedule stored in memory.
 struct Schedule {
-  bool     used;                    // false = this slot is empty
-  int      id;                      // unique ID assigned at creation
-  char     name[32];                // human-readable name (set via API)
-  ZoneStep steps[MAX_ZONE_STEPS];   // ordered list of zone steps
-  int      stepCount;               // number of active steps
-  bool     autoRun;                 // true = fire automatically every day
-  int      runHour;                 // 0–23, local time
-  int      runMinute;               // 0–59, local time
+  bool     used;                         // false = no schedule loaded
+  int      id;                           // ID assigned at creation, increments on replace
+  char     name[32];                     // human-readable name
+  ZoneStep steps[SCHEDULE_MAX_STEPS];    // ordered list of zone steps
+  int      stepCount;                    // number of active steps
+  bool     autoRun;                      // true = fire automatically every day
+  int      runHour;                      // 0–23, local time
+  int      runMinute;                    // 0–59, local time
 };
 
 // ── Global state ───────────────────────────────────────────────────────────
 
-Schedule      schedules[MAX_SCHEDULES];
-int           nextScheduleId = 1;                         // increments with each new schedule
-unsigned long lastRunEpoch[MAX_SCHEDULES] = {0};          // epoch time of last auto-run per slot
+Schedule      theSchedule   = {false};
+int           nextScheduleId = 1;
+unsigned long lastRunEpoch   = 0;
 
-// Tracks which schedule is currently running and which step is active.
+// Tracks which step is currently running.
 struct RunState {
-  bool          running;        // true while a schedule is in progress
-  int           scheduleIndex;  // index into schedules[] (not the schedule ID)
-  int           stepIndex;      // which step is currently active
-  unsigned long stepStart;      // millis() when the current step began
+  bool          running;
+  int           stepIndex;
+  unsigned long stepStart;
 };
-RunState runState = {false, -1, 0, 0};
+RunState runState = {false, 0, 0};
 
 // ── Initialisation ─────────────────────────────────────────────────────────
 
 void schedulesInit() {
-  for (int i = 0; i < MAX_SCHEDULES; i++) {
-    schedules[i].used      = false;
-    schedules[i].autoRun   = false;
-    schedules[i].runHour   = 6;    // default auto-run time: 6:00 AM
-    schedules[i].runMinute = 0;
-  }
-}
-
-// ── Lookup helpers ─────────────────────────────────────────────────────────
-
-// Find the array index for a schedule by its public ID. Returns -1 if not found.
-int findScheduleIndex(int id) {
-  for (int i = 0; i < MAX_SCHEDULES; i++)
-    if (schedules[i].used && schedules[i].id == id) return i;
-  return -1;
-}
-
-// Find the first empty slot in schedules[]. Returns -1 if all slots are full.
-int freeSlot() {
-  for (int i = 0; i < MAX_SCHEDULES; i++)
-    if (!schedules[i].used) return i;
-  return -1;
+  theSchedule.used      = false;
+  theSchedule.autoRun   = false;
+  theSchedule.runHour   = 6;
+  theSchedule.runMinute = 0;
+  lastRunEpoch          = 0;
 }
 
 // ── JSON serialization ─────────────────────────────────────────────────────
 
-// Convert one schedule to a JSON object string.
+// Convert the schedule to a JSON object string.
 String scheduleToJson(const Schedule& s) {
   char timeBuf[6];
   snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", s.runHour, s.runMinute);
@@ -107,29 +91,19 @@ String scheduleToJson(const Schedule& s) {
   return json;
 }
 
-// Convert all stored schedules to a JSON array string.
+// Returns an array with the one schedule, or an empty array.
 String schedulesListJson() {
-  String json = "[";
-  bool first = true;
-  for (int i = 0; i < MAX_SCHEDULES; i++) {
-    if (!schedules[i].used) continue;
-    if (!first) json += ",";
-    json += scheduleToJson(schedules[i]);
-    first = false;
-  }
-  json += "]";
-  return json;
+  if (!theSchedule.used) return "[]";
+  return "[" + scheduleToJson(theSchedule) + "]";
 }
 
 // Build a JSON object describing the current run state.
-// Used by GET /schedules/run.
 String runStateJson() {
   if (!runState.running) return "{\"running\":false}";
-  Schedule& s    = schedules[runState.scheduleIndex];
-  ZoneStep& step = s.steps[runState.stepIndex];
+  ZoneStep& step    = theSchedule.steps[runState.stepIndex];
   unsigned long elapsed = (millis() - runState.stepStart) / 1000UL;
   return "{\"running\":true"
-         ",\"schedule_id\":"  + String(s.id) +
+         ",\"schedule_id\":"  + String(theSchedule.id) +
          ",\"step\":"         + String(runState.stepIndex + 1) +
          ",\"zone\":"         + String(step.zoneId) +
          ",\"elapsed_sec\":"  + String(elapsed) +
@@ -149,10 +123,8 @@ bool parseScheduleBody(const String& body, Schedule& s) {
   if (doc["name"].is<const char*>())
     strncpy(s.name, doc["name"].as<const char*>(), sizeof(s.name) - 1);
 
-  if (doc["auto_run"].is<bool>())
-    s.autoRun = doc["auto_run"].as<bool>();
+  s.autoRun = doc["auto_run"].is<bool>() ? doc["auto_run"].as<bool>() : false;
 
-  // run_time must be a string in "HH:MM" 24-hour format
   if (doc["run_time"].is<const char*>()) {
     const char* t = doc["run_time"].as<const char*>();
     int h = 0, m = 0;
@@ -162,11 +134,10 @@ bool parseScheduleBody(const String& body, Schedule& s) {
     }
   }
 
-  // zones is an array of {"zone": N, "duration": S} objects
   JsonArray zones = doc["zones"].as<JsonArray>();
   s.stepCount = 0;
   for (JsonObject z : zones) {
-    if (s.stepCount >= MAX_ZONE_STEPS) break;
+    if (s.stepCount >= SCHEDULE_MAX_STEPS) break;
     int zoneId   = z["zone"].as<int>();
     int duration = z["duration"].as<int>();
     if (zoneId < 1 || zoneId > ZONE_COUNT || duration <= 0) continue;
@@ -177,25 +148,24 @@ bool parseScheduleBody(const String& body, Schedule& s) {
 
 // ── Schedule runner ────────────────────────────────────────────────────────
 
-// Start running a schedule, skipping any steps whose zone is disabled.
-// Stops any currently running schedule first. Does nothing if every step
-// in the schedule belongs to a disabled zone.
-void startSchedule(int index) {
+// Start running the schedule, skipping any steps whose zone is disabled.
+// Stops any currently running schedule first.
+void startSchedule() {
+  if (!theSchedule.used) return;
   allZonesOff();
-  Schedule& sched = schedules[index];
+  runState.running = false;
 
   // Find the first step with an enabled zone
   int first = -1;
-  for (int i = 0; i < sched.stepCount; i++) {
-    if (zoneEnabled[sched.steps[i].zoneId - 1]) { first = i; break; }
+  for (int i = 0; i < theSchedule.stepCount; i++) {
+    if (zoneEnabled[theSchedule.steps[i].zoneId - 1]) { first = i; break; }
   }
   if (first < 0) return;  // nothing enabled to run
 
-  runState.running       = true;
-  runState.scheduleIndex = index;
-  runState.stepIndex     = first;
-  runState.stepStart     = millis();
-  setZone(sched.steps[first].zoneId - 1, true);
+  runState.running   = true;
+  runState.stepIndex = first;
+  runState.stepStart = millis();
+  setZone(theSchedule.steps[first].zoneId - 1, true);
 }
 
 // Stop the running schedule and turn all zones off immediately.
@@ -210,56 +180,51 @@ void stopSchedule() {
 void scheduleTick() {
   if (!runState.running) return;
 
-  Schedule& sched = schedules[runState.scheduleIndex];
-  ZoneStep& step  = sched.steps[runState.stepIndex];
+  ZoneStep& step = theSchedule.steps[runState.stepIndex];
 
   if (millis() - runState.stepStart >= (unsigned long)step.duration * 1000UL) {
     setZone(step.zoneId - 1, false);
 
     // Advance to the next step that has an enabled zone
     int next = runState.stepIndex + 1;
-    while (next < sched.stepCount && !zoneEnabled[sched.steps[next].zoneId - 1]) next++;
+    while (next < theSchedule.stepCount && !zoneEnabled[theSchedule.steps[next].zoneId - 1]) next++;
 
-    if (next >= sched.stepCount) {
-      runState.running = false;  // all remaining steps disabled or done
+    if (next >= theSchedule.stepCount) {
+      runState.running = false;  // all done
     } else {
       runState.stepIndex = next;
-      setZone(sched.steps[next].zoneId - 1, true);
+      setZone(theSchedule.steps[next].zoneId - 1, true);
       runState.stepStart = millis();
     }
   }
 }
 
-// Called every loop(). Checks every 30 seconds whether any auto-run schedule
-// is due. A schedule fires if:
-//   - auto_run is enabled
+// Called every loop(). Checks every 30 seconds whether the auto-run schedule
+// is due. Fires if:
+//   - a schedule is loaded and auto_run is enabled
 //   - the current hour and minute match its run_time
 //   - it has not already run within the last 23 hours
-// Only one schedule can start per check. If a schedule is already running,
-// this function does nothing until it finishes.
+// Does nothing if a schedule is already running.
 void schedulerCheck() {
-  if (!ntpReady) return;
-  if (runState.running) return;
+  if (!ntpReady)          return;
+  if (runState.running)   return;
+  if (!theSchedule.used)  return;
+  if (!theSchedule.autoRun) return;
 
   static unsigned long lastCheck = 0;
   if (millis() - lastCheck < 30000UL) return;
   lastCheck = millis();
 
-  int nowHour   = ntpHour();
-  int nowMinute = ntpMinute();
-  unsigned long nowEpoch = ntpEpoch();
+  int           nowHour   = ntpHour();
+  int           nowMinute = ntpMinute();
+  unsigned long nowEpoch  = ntpEpoch();
 
-  for (int i = 0; i < MAX_SCHEDULES; i++) {
-    if (!schedules[i].used)    continue;
-    if (!schedules[i].autoRun) continue;
-    if (schedules[i].runHour   != nowHour)   continue;
-    if (schedules[i].runMinute != nowMinute) continue;
-    if (nowEpoch - lastRunEpoch[i] < 23 * 3600UL) continue;
+  if (theSchedule.runHour   != nowHour)   return;
+  if (theSchedule.runMinute != nowMinute) return;
+  if (nowEpoch - lastRunEpoch < 23 * 3600UL) return;
 
-    Serial.print("Auto-starting schedule: ");
-    Serial.println(schedules[i].name);
-    startSchedule(i);
-    lastRunEpoch[i] = nowEpoch;
-    break;
-  }
+  Serial.print("Auto-starting schedule: ");
+  Serial.println(theSchedule.name);
+  startSchedule();
+  lastRunEpoch = nowEpoch;
 }

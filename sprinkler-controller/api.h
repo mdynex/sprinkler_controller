@@ -67,16 +67,17 @@ void routeZoneControl(WiFiClient& client, HttpRequest& req) {
 
 // Handle POST /schedules/{id}/run
 // Extracts the schedule id from between "/schedules/" and "/run".
+// Since there is only one schedule, the id is accepted as long as it matches.
 void routeRunSchedule(WiFiClient& client, const String& path) {
-  String idStr = path.substring(11, path.length() - 4);
-  int    idx   = findScheduleIndex(idStr.toInt());
-  if (idx < 0) { sendResponse(client, 404, "{\"error\":\"schedule not found\"}"); return; }
-
-  startSchedule(idx);
+  int id = path.substring(11, path.length() - 4).toInt();
+  if (!theSchedule.used || theSchedule.id != id) {
+    sendResponse(client, 404, "{\"error\":\"schedule not found\"}"); return;
+  }
+  startSchedule();
   needsRedraw = true;
   wakeDisplay();
   sendResponse(client, 200,
-    "{\"started\":true,\"schedule_id\":" + String(schedules[idx].id) + "}");
+    "{\"started\":true,\"schedule_id\":" + String(theSchedule.id) + "}");
 }
 
 // Main request dispatcher — called for every incoming HTTP request.
@@ -126,7 +127,7 @@ void handleApi(WiFiClient& client, HttpRequest& req) {
       ",\"enabled\":" + (zoneEnabled[id] ? "true" : "false") +
       ",\"rate\":"    + rateBuf + "}");
 
-  // GET /schedules — list all schedules
+  // GET /schedules — return the one schedule (or an empty array)
   } else if (m == "GET" && p == "/schedules") {
     sendResponse(client, 200, schedulesListJson());
 
@@ -135,48 +136,50 @@ void handleApi(WiFiClient& client, HttpRequest& req) {
   } else if (m == "GET" && p == "/schedules/run") {
     sendResponse(client, 200, runStateJson());
 
-  // GET /schedules/{id} — get one schedule
+  // GET /schedules/{id} — get the schedule (id must match)
   } else if (m == "GET" && p.startsWith("/schedules/")) {
-    int idx = findScheduleIndex(p.substring(11).toInt());
-    if (idx < 0) { sendResponse(client, 404, "{\"error\":\"schedule not found\"}"); return; }
-    sendResponse(client, 200, scheduleToJson(schedules[idx]));
+    int id = p.substring(11).toInt();
+    if (!theSchedule.used || theSchedule.id != id) {
+      sendResponse(client, 404, "{\"error\":\"schedule not found\"}"); return;
+    }
+    sendResponse(client, 200, scheduleToJson(theSchedule));
 
-  // POST /schedules — create a new schedule
+  // POST /schedules — replace the current schedule (stops any running schedule)
   } else if (m == "POST" && p == "/schedules") {
-    int slot = freeSlot();
-    if (slot < 0) { sendResponse(client, 400, "{\"error\":\"max schedules reached\"}"); return; }
-
     Schedule s = {};
     if (!parseScheduleBody(req.body, s)) {
       sendResponse(client, 400, "{\"error\":\"invalid body\"}"); return;
     }
+    if (runState.running) stopSchedule();
     s.used = true;
     s.id   = nextScheduleId++;
-    schedules[slot] = s;
-    sendResponse(client, 201, scheduleToJson(schedules[slot]));
+    theSchedule = s;
+    sendResponse(client, 201, scheduleToJson(theSchedule));
 
-  // PUT /schedules/{id} — update an existing schedule
+  // PUT /schedules/{id} — update the schedule in-place (id must match)
   } else if (m == "PUT" && p.startsWith("/schedules/")) {
-    int id  = p.substring(11).toInt();
-    int idx = findScheduleIndex(id);
-    if (idx < 0) { sendResponse(client, 404, "{\"error\":\"schedule not found\"}"); return; }
-
-    Schedule s = schedules[idx];  // start from existing values so partial updates work
+    int id = p.substring(11).toInt();
+    if (!theSchedule.used || theSchedule.id != id) {
+      sendResponse(client, 404, "{\"error\":\"schedule not found\"}"); return;
+    }
+    Schedule s = theSchedule;  // start from existing values so partial updates work
     if (!parseScheduleBody(req.body, s)) {
       sendResponse(client, 400, "{\"error\":\"invalid body\"}"); return;
     }
-    schedules[idx] = s;
-    sendResponse(client, 200, scheduleToJson(schedules[idx]));
+    theSchedule = s;
+    sendResponse(client, 200, scheduleToJson(theSchedule));
 
-  // DELETE /schedules/{id} — remove a schedule
+  // DELETE /schedules/{id} — remove the schedule (id must match)
   } else if (m == "DELETE" && p.startsWith("/schedules/")) {
-    int idx = findScheduleIndex(p.substring(11).toInt());
-    if (idx < 0) { sendResponse(client, 404, "{\"error\":\"schedule not found\"}"); return; }
-    if (runState.running && runState.scheduleIndex == idx) stopSchedule();
-    schedules[idx].used = false;
+    int id = p.substring(11).toInt();
+    if (!theSchedule.used || theSchedule.id != id) {
+      sendResponse(client, 404, "{\"error\":\"schedule not found\"}"); return;
+    }
+    if (runState.running) stopSchedule();
+    theSchedule.used = false;
     sendResponse(client, 200, "{\"deleted\":true}");
 
-  // POST /schedules/{id}/run — start a schedule immediately
+  // POST /schedules/{id}/run — start the schedule immediately (id must match)
   } else if (m == "POST" && p.startsWith("/schedules/") && p.endsWith("/run")) {
     routeRunSchedule(client, p);
 
