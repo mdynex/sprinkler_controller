@@ -28,6 +28,7 @@
 #include <Arduino_GigaDisplay_GFX.h>
 #include <Arduino_GigaDisplayTouch.h>
 #include "config.h"
+#include "registration.h"
 #include "http_utils.h"
 #include "zones.h"
 #include "ntp.h"
@@ -44,9 +45,10 @@ void setup() {
   displayInit();    // start display first so the user sees status messages
   zonesInit();      // configure relay pins and ensure all zones are off
   schedulesInit();  // clear the schedule slots
-  connectWiFi();    // block until connected, showing status on screen
-  ntpInit();        // sync time from pool.ntp.org
-  server.begin();   // start the HTTP server on port 80
+  connectWiFi();          // block until connected, showing status on screen
+  registerWithServer();   // register/update IP in the Home AI Server device registry
+  ntpInit();              // sync time from pool.ntp.org
+  server.begin();         // start the HTTP server on port 80
   Serial.print("API ready at http://");
   Serial.println(WiFi.localIP());
 }
