@@ -36,21 +36,6 @@
 #define ZN_W     181   // (800 - 5*15) / 4
 #define ZN_H     137   // (320 - 3*15) / 2  (CONT_H=320)
 
-// Edit: zone list rows
-#define ED_ROW_H    35
-#define ED_START_Y  HDR_H     // rows start immediately after header
-#define ED_SETT_Y  (HDR_H + ZONE_COUNT * ED_ROW_H)   // 330
-// Edit row column x positions
-#define ED_TOG_X    15
-#define ED_TOG_W    65
-#define ED_LBL_X    90
-#define ED_DEC_X   390
-#define ED_DEC_W    45
-#define ED_DUR_X   440
-#define ED_DUR_W    70
-#define ED_INC_X   515
-#define ED_INC_W    45
-#define ED_UNIT_X  565
 
 // ── Global objects ─────────────────────────────────────────────────────────
 GigaDisplay_GFX          gfx;
@@ -92,46 +77,28 @@ void _onTouch(uint8_t contacts, GDTpoint_t* pts) {
 }
 
 // ── Edit screen state ──────────────────────────────────────────────────────
-struct EditZone {
-  bool enabled;
-  int  durationMin;   // 1–99 minutes
-};
-
-bool     _editAutoRun = false;
-int      _editHour    = 6;
-int      _editMin     = 0;
-EditZone _editZones[ZONE_COUNT];
+bool _editAutoRun = false;
+int  _editHour    = 6;
+int  _editMin     = 0;
 
 // ── Zone Settings paging ───────────────────────────────────────────────────
 #define ZS_ZONES_PER_PAGE  4
 int _zoneSettingsPage = 0;   // 0 = zones 1-4, 1 = zones 5-8, etc.
 
+// Load only the auto-run settings from the schedule into edit state.
+// Zone steps are managed by the app and are not editable on the display.
 void _loadEditState() {
   _editAutoRun = theSchedule.autoRun;
   _editHour    = theSchedule.runHour;
   _editMin     = theSchedule.runMinute;
-  for (int z = 0; z < ZONE_COUNT; z++) {
-    _editZones[z] = {false, 5};
-  }
-  for (int st = 0; st < theSchedule.stepCount; st++) {
-    int z = theSchedule.steps[st].zoneId - 1;
-    if (z >= 0 && z < ZONE_COUNT) {
-      _editZones[z].enabled     = true;
-      _editZones[z].durationMin = max(1, theSchedule.steps[st].duration / 60);
-    }
-  }
 }
 
+// Save only the auto-run settings back to the schedule.
+// Zone steps are left untouched.
 void _saveEditState() {
   theSchedule.autoRun   = _editAutoRun;
   theSchedule.runHour   = _editHour;
   theSchedule.runMinute = _editMin;
-  theSchedule.stepCount = 0;
-  for (int z = 0; z < ZONE_COUNT; z++) {
-    if (!_editZones[z].enabled) continue;
-    if (theSchedule.stepCount >= SCHEDULE_MAX_STEPS) break;
-    theSchedule.steps[theSchedule.stepCount++] = {z + 1, _editZones[z].durationMin * 60};
-  }
 }
 
 // ── Sleep / wake ───────────────────────────────────────────────────────────
@@ -381,91 +348,11 @@ void _handleSchedulesTouch(int tx, int ty) {
 }
 
 // ── EDIT screen ────────────────────────────────────────────────────────────
+// The display can only toggle auto-run on/off and change the run time.
+// Zone steps are defined by the app and are shown here as read-only info.
 
-void _drawEditZoneRow(int z) {
-  int y   = ED_START_Y + z * ED_ROW_H;
-  int bty = y + (ED_ROW_H - 28) / 2;
-  gfx.fillRect(0, y, SCR_W, ED_ROW_H, z % 2 == 0 ? C_ROW_A : C_ROW_B);
-
-  // Zone toggle
-  _btn(ED_TOG_X, bty, ED_TOG_W, 28,
-       _editZones[z].enabled ? C_GREEN : C_GRAY,
-       _editZones[z].enabled ? "ON" : "OFF", 1,
-       _editZones[z].enabled ? C_BLACK : C_WHITE);
-
-  // Label
-  gfx.setTextColor(C_WHITE);
-  gfx.setTextSize(2);
-  gfx.setCursor(ED_LBL_X, y + (ED_ROW_H - 16) / 2);
-  char lbl[8];
-  snprintf(lbl, sizeof(lbl), "Zone %d", z + 1);
-  gfx.print(lbl);
-
-  if (_editZones[z].enabled) {
-    // Duration [-] value [+] min
-    _btn(ED_DEC_X, bty, ED_DEC_W, 28, C_GRAY, "-");
-    gfx.setTextColor(C_WHITE);
-    gfx.setTextSize(2);
-    char dur[4];
-    snprintf(dur, sizeof(dur), "%d", _editZones[z].durationMin);
-    int tw = strlen(dur) * 12;
-    gfx.setCursor(ED_DUR_X + (ED_DUR_W - tw) / 2, y + (ED_ROW_H - 16) / 2);
-    gfx.print(dur);
-    _btn(ED_INC_X, bty, ED_INC_W, 28, C_GRAY, "+");
-    gfx.setTextColor(C_DIM);
-    gfx.setTextSize(1);
-    gfx.setCursor(ED_UNIT_X, y + (ED_ROW_H - 8) / 2);
-    gfx.print("min");
-  } else {
-    gfx.setTextColor(C_DIM);
-    gfx.setTextSize(1);
-    gfx.setCursor(ED_DEC_X, y + (ED_ROW_H - 8) / 2);
-    gfx.print("tap ON to enable");
-  }
-}
-
-void _drawEditSettings() {
-  // Settings bar sits between zone rows and nav bar (y=330 to y=370)
-  int y   = ED_SETT_Y;
-  int h   = NAV_Y - ED_SETT_Y;   // remaining space = 40px
-  int bty = y + (h - 26) / 2;
-  gfx.fillRect(0, y, SCR_W, h, C_BLACK);
-
-  _btn(15, bty, 90, 26,
-       _editAutoRun ? C_GREEN : C_GRAY,
-       _editAutoRun ? "AUTO ON" : "AUTO OFF", 1,
-       _editAutoRun ? C_BLACK : C_WHITE);
-
-  if (_editAutoRun) {
-    gfx.setTextColor(C_WHITE);
-    gfx.setTextSize(1);
-    gfx.setCursor(115, y + (h - 8) / 2);
-    gfx.print("Run at:");
-
-    // Hour
-    _btn(175, bty, 35, 26, C_GRAY, "-", 1);
-    gfx.setTextColor(C_WHITE);
-    gfx.setTextSize(2);
-    char hbuf[3];
-    snprintf(hbuf, sizeof(hbuf), "%02d", _editHour);
-    gfx.setCursor(215, y + (h - 16) / 2);
-    gfx.print(hbuf);
-    _btn(245, bty, 35, 26, C_GRAY, "+", 1);
-
-    gfx.setTextColor(C_WHITE);
-    gfx.setTextSize(2);
-    gfx.setCursor(285, y + (h - 16) / 2);
-    gfx.print(":");
-
-    // Minute
-    _btn(300, bty, 35, 26, C_GRAY, "-", 1);
-    char mbuf[3];
-    snprintf(mbuf, sizeof(mbuf), "%02d", _editMin);
-    gfx.setCursor(340, y + (h - 16) / 2);
-    gfx.print(mbuf);
-    _btn(370, bty, 35, 26, C_GRAY, "+", 1);
-  }
-}
+#define ED_BTN_Y  (HDR_H + 120)   // y position of auto-run controls
+#define ED_BTN_H  50
 
 void _drawEditScreen() {
   gfx.fillScreen(C_BG);
@@ -473,8 +360,60 @@ void _drawEditScreen() {
   snprintf(title, sizeof(title), "EDIT: %s", theSchedule.name);
   _drawHeader(title);
 
-  for (int z = 0; z < ZONE_COUNT; z++) _drawEditZoneRow(z);
-  _drawEditSettings();
+  // Read-only zone step count
+  gfx.setTextColor(C_DIM);
+  gfx.setTextSize(2);
+  gfx.setCursor(20, HDR_H + 30);
+  char info[32];
+  snprintf(info, sizeof(info), "%d step%s (set by app)",
+           theSchedule.stepCount, theSchedule.stepCount == 1 ? "" : "s");
+  gfx.print(info);
+
+  // Divider
+  gfx.drawFastHLine(20, HDR_H + 65, SCR_W - 40, C_GRAY);
+
+  // Auto-run toggle
+  gfx.setTextColor(C_WHITE);
+  gfx.setTextSize(2);
+  gfx.setCursor(20, ED_BTN_Y - 25);
+  gfx.print("Auto-run");
+
+  _btn(20, ED_BTN_Y, 160, ED_BTN_H,
+       _editAutoRun ? C_GREEN : C_GRAY,
+       _editAutoRun ? "AUTO ON" : "AUTO OFF", 2,
+       _editAutoRun ? C_BLACK : C_WHITE);
+
+  if (_editAutoRun) {
+    gfx.setTextColor(C_DIM);
+    gfx.setTextSize(2);
+    gfx.setCursor(205, ED_BTN_Y + (ED_BTN_H - 16) / 2);
+    gfx.print("Run at:");
+
+    // Hour [-] HH [+]
+    _btn(330, ED_BTN_Y, ED_BTN_H, ED_BTN_H, C_GRAY, "-");
+    char hbuf[3];
+    snprintf(hbuf, sizeof(hbuf), "%02d", _editHour);
+    gfx.setTextColor(C_WHITE);
+    gfx.setTextSize(3);
+    gfx.setCursor(392, ED_BTN_Y + (ED_BTN_H - 24) / 2);
+    gfx.print(hbuf);
+    _btn(430, ED_BTN_Y, ED_BTN_H, ED_BTN_H, C_GRAY, "+");
+
+    gfx.setTextSize(3);
+    gfx.setTextColor(C_DIM);
+    gfx.setCursor(492, ED_BTN_Y + (ED_BTN_H - 24) / 2);
+    gfx.print(":");
+
+    // Minute [-] MM [+]
+    _btn(515, ED_BTN_Y, ED_BTN_H, ED_BTN_H, C_GRAY, "-");
+    char mbuf[3];
+    snprintf(mbuf, sizeof(mbuf), "%02d", _editMin);
+    gfx.setTextColor(C_WHITE);
+    gfx.setTextSize(3);
+    gfx.setCursor(577, ED_BTN_Y + (ED_BTN_H - 24) / 2);
+    gfx.print(mbuf);
+    _btn(615, ED_BTN_Y, ED_BTN_H, ED_BTN_H, C_GRAY, "+");
+  }
 
   gfx.fillRect(0, NAV_Y, SCR_W, NAV_H, C_BG);
   _btn(20,          NAV_Y + 10, 160, 50, C_GRAY,  "CANCEL");
@@ -484,52 +423,28 @@ void _drawEditScreen() {
 }
 
 void _handleEditTouch(int tx, int ty) {
-  // Nav
   if (_inRect(tx, ty, 20, NAV_Y + 10, 160, 50)) {
     currentScreen = SCR_SCHEDULES; needsRedraw = true; return;
   }
   if (_inRect(tx, ty, 320, NAV_Y + 10, 160, 50)) {
-    _saveEditState();
-    currentScreen = SCR_SCHEDULES; needsRedraw = true; return;
+    _saveEditState(); currentScreen = SCR_SCHEDULES; needsRedraw = true; return;
   }
   if (_inRect(tx, ty, SCR_W - 200, NAV_Y + 10, 180, 50)) {
-    _saveEditState();
-    startSchedule();
-    currentScreen = SCR_HOME; needsRedraw = true; return;
+    _saveEditState(); startSchedule(); currentScreen = SCR_HOME; needsRedraw = true; return;
   }
 
-  // Settings bar
-  int sy   = ED_SETT_Y;
-  int sh   = NAV_Y - ED_SETT_Y;
-  int sbty = sy + (sh - 26) / 2;
-  if (_inRect(tx, ty, 15, sbty, 90, 26)) {
-    _editAutoRun = !_editAutoRun; _drawEditSettings(); return;
+  // Auto-run toggle
+  if (_inRect(tx, ty, 20, ED_BTN_Y, 160, ED_BTN_H)) {
+    _editAutoRun = !_editAutoRun; needsRedraw = true; return;
   }
+
   if (_editAutoRun) {
-    if (_inRect(tx, ty, 175, sbty, 35, 26)) { _editHour = (_editHour + 23) % 24; _drawEditSettings(); return; }
-    if (_inRect(tx, ty, 245, sbty, 35, 26)) { _editHour = (_editHour +  1) % 24; _drawEditSettings(); return; }
-    if (_inRect(tx, ty, 300, sbty, 35, 26)) { _editMin  = (_editMin  + 55) % 60; _drawEditSettings(); return; }
-    if (_inRect(tx, ty, 370, sbty, 35, 26)) { _editMin  = (_editMin  +  5) % 60; _drawEditSettings(); return; }
-  }
-
-  // Zone rows
-  for (int z = 0; z < ZONE_COUNT; z++) {
-    int y   = ED_START_Y + z * ED_ROW_H;
-    int bty = y + (ED_ROW_H - 28) / 2;
-    if (_inRect(tx, ty, ED_TOG_X, bty, ED_TOG_W, 28)) {
-      _editZones[z].enabled = !_editZones[z].enabled;
-      _drawEditZoneRow(z); return;
-    }
-    if (_editZones[z].enabled) {
-      if (_inRect(tx, ty, ED_DEC_X, bty, ED_DEC_W, 28)) {
-        if (_editZones[z].durationMin > 1) _editZones[z].durationMin--;
-        _drawEditZoneRow(z); return;
-      }
-      if (_inRect(tx, ty, ED_INC_X, bty, ED_INC_W, 28)) {
-        if (_editZones[z].durationMin < 99) _editZones[z].durationMin++;
-        _drawEditZoneRow(z); return;
-      }
-    }
+    // Hour
+    if (_inRect(tx, ty, 330, ED_BTN_Y, ED_BTN_H, ED_BTN_H)) { _editHour = (_editHour + 23) % 24; needsRedraw = true; return; }
+    if (_inRect(tx, ty, 430, ED_BTN_Y, ED_BTN_H, ED_BTN_H)) { _editHour = (_editHour +  1) % 24; needsRedraw = true; return; }
+    // Minute
+    if (_inRect(tx, ty, 515, ED_BTN_Y, ED_BTN_H, ED_BTN_H)) { _editMin  = (_editMin  + 55) % 60; needsRedraw = true; return; }
+    if (_inRect(tx, ty, 615, ED_BTN_Y, ED_BTN_H, ED_BTN_H)) { _editMin  = (_editMin  +  5) % 60; needsRedraw = true; return; }
   }
 }
 
