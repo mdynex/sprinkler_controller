@@ -35,6 +35,7 @@
 #include "schedules.h"
 #include "api.h"
 #include "display.h"
+#include "heartbeat.h"
 
 WiFiServer server(80);
 
@@ -57,6 +58,7 @@ void setup() {
 
 void loop() {
   ntpUpdate();       // re-syncs time once per hour (non-blocking)
+  heartbeatTick();   // sends keepalive to server once per minute (non-blocking)
   scheduleTick();    // advances the active schedule one step if its time is up
   schedulerCheck();  // fires any auto-run schedule whose time matches now
   displayLoop();     // processes touch input and redraws the screen if needed

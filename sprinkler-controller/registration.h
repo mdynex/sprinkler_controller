@@ -10,23 +10,27 @@
 // the Home AI Server. The server records the Arduino's current local IP and
 // device type so that /controller/* proxy requests are routed correctly.
 //
-// The server will return 200 whether the device is new or already registered
-// (the server deduplicates by name). An admin must approve the device in the
-// web panel or Android app before the proxy routes will use its address.
+// On a successful pairing the server returns a JSON body that includes a
+// device token. We store it in deviceToken[] so the heartbeat code can use
+// X-Device-Token to keep last_seen current in the Devices screen.
 //
 // Call registerWithServer() once from setup(), after connectWiFi() returns.
 // =============================================================================
 
+// Device token assigned by the server at pairing time.
+// 64 hex chars + null terminator. Empty until registration succeeds.
+char deviceToken[65] = "";
+
 void registerWithServer() {
   String ip = WiFi.localIP().toString();
 
-  // Build JSON body: {"name":"Sprinkler Controller","type":"controller","address":"192.168.x.x"}
-  StaticJsonDocument<192> doc;
-  doc["name"]    = DEVICE_NAME;
-  doc["type"]    = "controller";
-  doc["address"] = ip;
+  // Build JSON body: {"name":"...","type":"controller","address":"192.168.x.x"}
+  StaticJsonDocument<192> reqDoc;
+  reqDoc["name"]    = DEVICE_NAME;
+  reqDoc["type"]    = "controller";
+  reqDoc["address"] = ip;
   String body;
-  serializeJson(doc, body);
+  serializeJson(reqDoc, body);
 
   // Connect to server on port 8000
   WiFiClient client;
@@ -45,19 +49,60 @@ void registerWithServer() {
   client.println();
   client.print(body);
 
-  // Wait briefly for response
+  // ── Read response ─────────────────────────────────────────────────────────
+
+  // Wait for first byte
   unsigned long start = millis();
   while (!client.available() && millis() - start < 5000) delay(10);
 
+  // Read status line
   String statusLine = client.readStringUntil('\n');
-  client.stop();
-
   Serial.print("[register] Server response: ");
   Serial.println(statusLine);
 
-  if (statusLine.indexOf("200") >= 0 || statusLine.indexOf("201") >= 0) {
-    Serial.println("[register] Registered successfully as " + String(DEVICE_NAME) + " @ " + ip);
-  } else {
+  bool ok = statusLine.indexOf("200") >= 0 || statusLine.indexOf("201") >= 0;
+  if (!ok) {
     Serial.println("[register] Registration returned unexpected status — check API key and server");
+    client.stop();
+    return;
   }
+
+  // Skip headers (read until blank line)
+  while (client.connected()) {
+    String hdr = client.readStringUntil('\n');
+    hdr.trim();
+    if (hdr.length() == 0) break;  // blank line = end of headers
+  }
+
+  // Read response body
+  String respBody = "";
+  unsigned long bodyDeadline = millis() + 3000;
+  while (client.connected() && millis() < bodyDeadline) {
+    while (client.available()) {
+      respBody += (char)client.read();
+    }
+  }
+  client.stop();
+
+  // Parse token from JSON body
+  StaticJsonDocument<512> respDoc;
+  DeserializationError err = deserializeJson(respDoc, respBody);
+  if (err) {
+    Serial.println("[register] Could not parse response JSON — token not stored");
+    Serial.print("[register] Registered as ");
+    Serial.println(DEVICE_NAME);
+    return;
+  }
+
+  const char* tok = respDoc["token"];
+  if (tok && strlen(tok) > 0) {
+    strncpy(deviceToken, tok, sizeof(deviceToken) - 1);
+    deviceToken[sizeof(deviceToken) - 1] = '\0';
+    Serial.println("[register] Device token stored");
+  }
+
+  Serial.print("[register] Registered successfully as ");
+  Serial.print(DEVICE_NAME);
+  Serial.print(" @ ");
+  Serial.println(ip);
 }

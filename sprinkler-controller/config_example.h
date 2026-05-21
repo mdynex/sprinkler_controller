@@ -38,6 +38,6 @@ const int SLEEP_TIMEOUT_SEC = 60;
 // The Arduino registers itself with the server on each boot so the server
 // knows its current IP address and can route /controller/* requests to it.
 // Set SERVER_HOST to the Tailscale IP (or LAN IP) of your home server.
-const char* SERVER_HOST = "YOUR_SERVER_IP";   // e.g. "100.x.x.x" (Tailscale) or "192.168.1.x"
-const char* SERVER_API_KEY = "YOUR_API_KEY";  // must match API_KEY in server/.env
-const char* DEVICE_NAME = "Sprinkler Controller";
+const char* SERVER_HOST    = "YOUR_SERVER_IP";   // e.g. "192.168.1.x" — LAN IP of the server
+const char* SERVER_API_KEY = "YOUR_API_KEY";     // must match API_KEY in server/.env
+const char* DEVICE_NAME    = "Sprinkler Controller";
