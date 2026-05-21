@@ -3,15 +3,18 @@
 // =============================================================================
 // config_example.h — Configuration template
 //
-// Copy this file to config.h and fill in your own values.
-// config.h is listed in .gitignore so your credentials are never committed.
+// Copy this file to config.h. config.h is listed in .gitignore.
+//
+// As of the on-screen provisioning rewrite, WiFi credentials and the Home AI
+// Server URL are no longer compile-time settings:
+//   • WiFi  — picked from the on-screen network list on first boot and saved
+//             to KVStore.
+//   • Server — pushed to the Arduino via POST /provision when a user claims
+//              the device from the Android app, then saved to KVStore.
+//
+// The only compile-time settings that remain are the hardware-specific knobs
+// below.
 // =============================================================================
-
-// ── WiFi ───────────────────────────────────────────────────────────────────
-// Use your 2.4 GHz network name and password.
-// The Arduino Giga R1 WiFi does NOT support 5 GHz or 6 GHz networks.
-const char* WIFI_SSID     = "YOUR_2.4GHz_NETWORK_NAME";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 
 // ── Timezone ───────────────────────────────────────────────────────────────
 // Offset from UTC in seconds.
@@ -34,10 +37,7 @@ const int ZONE_PINS[ZONE_COUNT] = {2, 3, 4, 5, 6, 7, 8, 9};
 // Set to 0 to disable sleep entirely.
 const int SLEEP_TIMEOUT_SEC = 60;
 
-// ── Home AI Server ───────────────────────────────────────────────────────────
-// The Arduino registers itself with the server on each boot so the server
-// knows its current IP address and can route /controller/* requests to it.
-// Set SERVER_HOST to the Tailscale IP (or LAN IP) of your home server.
-const char* SERVER_HOST    = "YOUR_SERVER_IP";   // e.g. "192.168.1.x" — LAN IP of the server
-const char* SERVER_API_KEY = "YOUR_API_KEY";     // must match API_KEY in server/.env
-const char* DEVICE_NAME    = "Sprinkler Controller";
+// ── Device name ─────────────────────────────────────────────────────────────
+// Friendly default shown on the pairing screen and pre-filled in the app's
+// Add Device sheet. The user can rename the device when they claim it.
+const char* DEVICE_NAME = "Sprinkler Controller";

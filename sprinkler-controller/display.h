@@ -43,8 +43,37 @@ Arduino_GigaDisplayTouch touch;
 GigaDisplayBacklight     _backlight;
 
 // ── Screen state ───────────────────────────────────────────────────────────
-enum Screen { SCR_HOME, SCR_SCHEDULES, SCR_EDIT, SCR_ZONE_SETTINGS };
+enum Screen {
+  SCR_HOME,
+  SCR_SCHEDULES,
+  SCR_EDIT,
+  SCR_ZONE_SETTINGS,
+  SCR_PAIRING,            // STATE_PAIRING — QR + claim code
+  SCR_WIFI_LIST,          // STATE_WIFI_SETUP — pick a network
+  SCR_WIFI_PASSWORD,      // STATE_WIFI_SETUP — keyboard for the password
+  SCR_WIFI_CONNECTING,    // STATE_WIFI_SETUP — "Connecting…" splash
+  SCR_SETTINGS,           // gear icon → Settings menu
+  SCR_ABOUT               // Settings → About
+};
 Screen        currentScreen   = SCR_HOME;
+
+// Forward declarations — definitions live in pairing.h, wifi_setup.h, settings.h
+// (all included after display.h in the .ino so the compiler can resolve them)
+void _drawPairingScreen();
+void _handlePairingTouch(int tx, int ty);
+namespace wifi_setup {
+  void drawListScreen();
+  void drawPasswordScreen();
+  void drawConnectingScreen();
+  void handleListTouch(int tx, int ty);
+  void handlePasswordTouch(int tx, int ty);
+}
+namespace settings {
+  void drawSettingsScreen();
+  void drawAboutScreen();
+  void handleSettingsTouch(int tx, int ty);
+  void handleAboutTouch(int tx, int ty);
+}
 bool          needsRedraw     = true;
 String        _lastTime       = "";
 bool          _lastRunning    = false;
@@ -134,12 +163,27 @@ void _btn(int x, int y, int w, int h, uint16_t color, const char* lbl, int sz = 
 
 // ── Common elements ────────────────────────────────────────────────────────
 
+// Hit-test region for the home-screen "Settings" icon in the header.
+// Defined here so _handleHomeTouch (below) can reuse the same coordinates.
+constexpr int HDR_MENU_X = 720;   // x of menu icon (3 bars)
+constexpr int HDR_MENU_Y = 14;
+constexpr int HDR_MENU_W = 32;
+constexpr int HDR_MENU_H = 22;
+
 void _drawHeader(const char* title) {
   gfx.fillRect(0, 0, SCR_W, HDR_H, C_BLACK);
   gfx.setTextColor(C_WHITE);
   gfx.setTextSize(2);
   gfx.setCursor(15, 17);
   gfx.print(title);
+
+  // Settings/menu icon (three horizontal bars) — only shown on the home screen
+  if (currentScreen == SCR_HOME) {
+    for (int i = 0; i < 3; i++) {
+      gfx.fillRect(HDR_MENU_X, HDR_MENU_Y + i * 8, HDR_MENU_W, 3, C_WHITE);
+    }
+  }
+
   if (ntpReady) {
     String t = ntpFormattedTime().substring(0, 5);  // show HH:MM only
     gfx.setCursor(SCR_W - 15 - (int)t.length() * 12, 17);
@@ -238,6 +282,12 @@ void _drawHomeScreen() {
 }
 
 void _handleHomeTouch(int tx, int ty) {
+  // Settings menu — tap on the hamburger icon in the header
+  if (_inRect(tx, ty, HDR_MENU_X - 4, HDR_MENU_Y - 4, HDR_MENU_W + 8, HDR_MENU_H + 8)) {
+    currentScreen = SCR_SETTINGS;
+    needsRedraw = true;
+    return;
+  }
   for (int i = 0; i < ZONE_COUNT; i++) {
     int x = ZN_PAD + (i % ZN_COLS) * (ZN_W + ZN_PAD);
     int y = HDR_H  + ZN_PAD + (i / ZN_COLS) * (ZN_H + ZN_PAD);
@@ -607,10 +657,16 @@ void displayLoop() {
   // Full redraw only when changing screens or on first boot
   if (needsRedraw) {
     switch (currentScreen) {
-      case SCR_HOME:          _drawHomeScreen();          break;
-      case SCR_SCHEDULES:     _drawSchedulesScreen();     break;
-      case SCR_EDIT:          _drawEditScreen();          break;
-      case SCR_ZONE_SETTINGS: _drawZoneSettingsScreen();  break;
+      case SCR_HOME:             _drawHomeScreen();                  break;
+      case SCR_SCHEDULES:        _drawSchedulesScreen();             break;
+      case SCR_EDIT:             _drawEditScreen();                  break;
+      case SCR_ZONE_SETTINGS:    _drawZoneSettingsScreen();          break;
+      case SCR_PAIRING:          _drawPairingScreen();               break;
+      case SCR_WIFI_LIST:        wifi_setup::drawListScreen();       break;
+      case SCR_WIFI_PASSWORD:    wifi_setup::drawPasswordScreen();   break;
+      case SCR_WIFI_CONNECTING:  wifi_setup::drawConnectingScreen(); break;
+      case SCR_SETTINGS:         settings::drawSettingsScreen();     break;
+      case SCR_ABOUT:            settings::drawAboutScreen();        break;
     }
     needsRedraw  = false;
     _lastTime    = ntpReady ? ntpFormattedTime().substring(0, 5) : "";
@@ -658,10 +714,16 @@ void displayLoop() {
       _lastActivityMs = millis();
       int tx = _touchX, ty = _touchY;
       switch (currentScreen) {
-        case SCR_HOME:          _handleHomeTouch(tx, ty);          break;
-        case SCR_SCHEDULES:     _handleSchedulesTouch(tx, ty);     break;
-        case SCR_EDIT:          _handleEditTouch(tx, ty);          break;
-        case SCR_ZONE_SETTINGS: _handleZoneSettingsTouch(tx, ty);  break;
+        case SCR_HOME:             _handleHomeTouch(tx, ty);                 break;
+        case SCR_SCHEDULES:        _handleSchedulesTouch(tx, ty);            break;
+        case SCR_EDIT:             _handleEditTouch(tx, ty);                 break;
+        case SCR_ZONE_SETTINGS:    _handleZoneSettingsTouch(tx, ty);         break;
+        case SCR_PAIRING:          _handlePairingTouch(tx, ty);              break;
+        case SCR_WIFI_LIST:        wifi_setup::handleListTouch(tx, ty);      break;
+        case SCR_WIFI_PASSWORD:    wifi_setup::handlePasswordTouch(tx, ty);  break;
+        case SCR_WIFI_CONNECTING:  /* no-op: connect happens after draw */   break;
+        case SCR_SETTINGS:         settings::handleSettingsTouch(tx, ty);    break;
+        case SCR_ABOUT:            settings::handleAboutTouch(tx, ty);       break;
       }
     }
   }

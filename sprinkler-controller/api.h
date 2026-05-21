@@ -3,9 +3,11 @@
 #include "zones.h"
 #include "schedules.h"
 #include "ntp.h"
+#include "state.h"
 
 extern bool needsRedraw;   // defined in display.h — set true to trigger full screen refresh
 extern void wakeDisplay(); // defined in display.h — wakes backlight and resets sleep timer
+void routeProvision(WiFiClient& client, HttpRequest& req);  // defined in pairing.h
 
 // =============================================================================
 // api.h — REST API route handlers
@@ -84,6 +86,19 @@ void routeRunSchedule(WiFiClient& client, const String& path) {
 void handleApi(WiFiClient& client, HttpRequest& req) {
   String& m = req.method;
   String& p = req.path;
+
+  // POST /provision is the only route accepted while the device is in
+  // STATE_PAIRING. Once the device is RUNNING it returns 409.
+  if (m == "POST" && p == "/provision") {
+    routeProvision(client, req);
+    return;
+  }
+
+  // Block all other routes until the device is paired with a server.
+  if (deviceState != STATE_RUNNING) {
+    sendResponse(client, 503, "{\"error\":\"device unpaired\"}");
+    return;
+  }
 
   // GET /time — returns current synced time
   if (m == "GET" && p == "/time") {

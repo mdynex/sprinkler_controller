@@ -19,6 +19,7 @@ struct HttpRequest {
   String path;
   String body;
   int    contentLength;
+  String claimSecret;   // value of the X-Claim-Secret header, empty if absent
 };
 
 // Read a full HTTP request from the connected client.
@@ -46,11 +47,16 @@ HttpRequest readRequest(WiFiClient& client) {
         }
         firstLine = false;
       } else {
-        // Subsequent lines are headers — look for Content-Length
+        // Subsequent lines are headers — capture the ones we care about
         String lower = line;
         lower.toLowerCase();
-        if (lower.startsWith("content-length:"))
+        if (lower.startsWith("content-length:")) {
           req.contentLength = line.substring(line.indexOf(':') + 1).toInt();
+        } else if (lower.startsWith("x-claim-secret:")) {
+          String v = line.substring(line.indexOf(':') + 1);
+          v.trim();
+          req.claimSecret = v;
+        }
         // An empty line marks the end of headers
         if (line == "" || line == "\r") break;
       }
