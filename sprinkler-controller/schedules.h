@@ -51,6 +51,12 @@ struct Schedule {
   uint8_t  daysMask;                     // bit 0=Sun, 1=Mon, ..., 6=Sat
   int      runHour;
   int      runMinute;
+  // Where this schedule came from. "server" = pushed from the app /
+  // recommendation engine (treat steps as read-only, server owns the
+  // complex multi-zone/soak structure). "device" = built locally via
+  // SCR_NEW_SCHEDULE → SCR_NEW_DAYS (simpler, all-zones-same-duration).
+  // EDIT screen uses this to decide which affordances to expose.
+  char     origin[8];                    // "server" or "device"
 };
 
 // ── Global state ───────────────────────────────────────────────────────────
@@ -75,6 +81,8 @@ void schedulesInit() {
   theSchedule.daysMask  = 0;     // no auto-run by default
   theSchedule.runHour   = 6;
   theSchedule.runMinute = 0;
+  strncpy(theSchedule.origin, "server", sizeof(theSchedule.origin) - 1);
+  theSchedule.origin[sizeof(theSchedule.origin) - 1] = '\0';
   lastRunEpoch          = 0;
 }
 
@@ -87,6 +95,7 @@ String scheduleToJson(const Schedule& s) {
 
   String json = "{\"id\":"         + String(s.id) +
                 ",\"name\":\""     + s.name + "\"" +
+                ",\"origin\":\""   + s.origin + "\"" +
                 ",\"auto_run\":"   + (s.autoRun ? "true" : "false") +
                 ",\"run_time\":\"" + timeBuf + "\"" +
                 ",\"days\":[";
@@ -139,6 +148,17 @@ bool parseScheduleBody(const String& body, Schedule& s) {
 
   if (doc["name"].is<const char*>())
     strncpy(s.name, doc["name"].as<const char*>(), sizeof(s.name) - 1);
+
+  // Any schedule that arrives via POST /schedules came from the server / app.
+  // SCR_NEW_DAYS save in display.h overrides this to "device" for locally
+  // authored schedules. Honour an explicit "origin" field if the payload
+  // includes one (future-proofing for app-originated edits).
+  if (doc["origin"].is<const char*>()) {
+    strncpy(s.origin, doc["origin"].as<const char*>(), sizeof(s.origin) - 1);
+  } else {
+    strncpy(s.origin, "server", sizeof(s.origin) - 1);
+  }
+  s.origin[sizeof(s.origin) - 1] = '\0';
 
   // Days: explicit array wins. Otherwise fall back to auto_run as the legacy
   // "all 7 days" shortcut so the app's existing send-schedule flow keeps

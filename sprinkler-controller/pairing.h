@@ -67,23 +67,29 @@ void _drawPairingScreen() {
   gfx.fillScreen(C_BG);
   _drawHeader("PAIR THIS CONTROLLER");
 
-  // Device name + IP at the top
+  // Layout target (avoids the nav bar that starts at NAV_Y=370):
+  //   y= 55..80   Device name (size 2) + IP (size 1) on one line
+  //   y= 85..270  QR code (37 × 5 px modules + 10 px white quiet zone)
+  //   y=280..312  6-digit code (text size 4 ≈ 32 px tall)
+  //   y=320..350  Instruction line
+  //   y=370+      Nav row with SKIP button
+
+  // Device name + IP — single line, compact
   gfx.setTextColor(C_WHITE); gfx.setTextSize(2);
-  gfx.setCursor(20, HDR_H + 16);
+  gfx.setCursor(20, HDR_H + 8);
   gfx.print(DEVICE_NAME);
 
   gfx.setTextColor(C_DIM); gfx.setTextSize(1);
-  gfx.setCursor(20, HDR_H + 42);
-  gfx.print("IP: ");
+  gfx.setCursor(SCR_W - 220, HDR_H + 14);
   gfx.print(WiFi.localIP());
 
   // QR code — render in a white box (quiet zone)
   if (!_qrReady) _initPairingQR();
-  const int moduleSize = 7;                          // 37 × 7 = 259 px
+  const int moduleSize = 5;                          // 37 × 5 = 185 px
   const int qrW = _qr.size * moduleSize;
   const int qrX = (SCR_W - qrW) / 2;
-  const int qrY = HDR_H + 70;
-  gfx.fillRect(qrX - 10, qrY - 10, qrW + 20, qrW + 20, C_WHITE);
+  const int qrY = HDR_H + 38;                        // top of QR
+  gfx.fillRect(qrX - 8, qrY - 8, qrW + 16, qrW + 16, C_WHITE);
   for (uint8_t row = 0; row < _qr.size; row++) {
     for (uint8_t col = 0; col < _qr.size; col++) {
       if (qrcode_getModule(&_qr, col, row)) {
@@ -101,14 +107,14 @@ void _drawPairingScreen() {
   }
   gfx.setTextColor(C_WHITE); gfx.setTextSize(4);
   int codeW = spaced.length() * 24;
-  gfx.setCursor((SCR_W - codeW) / 2, qrY + qrW + 22);
+  gfx.setCursor((SCR_W - codeW) / 2, qrY + qrW + 15);
   gfx.print(spaced);
 
   // Instruction line
   const char* line1 = "Open the app -> Add Device -> Scan QR or enter code";
   gfx.setTextColor(C_DIM); gfx.setTextSize(1);
   int t1w = strlen(line1) * 6;
-  gfx.setCursor((SCR_W - t1w) / 2, qrY + qrW + 60);
+  gfx.setCursor((SCR_W - t1w) / 2, qrY + qrW + 55);
   gfx.print(line1);
 
   // Skip button — local-only mode without server pairing
