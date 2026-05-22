@@ -22,11 +22,12 @@ namespace storage {
 
 namespace {
 
-constexpr const char* K_WIFI_SSID = "wifi_ssid";
-constexpr const char* K_WIFI_PW   = "wifi_pw";
-constexpr const char* K_SRV_HOST  = "srv_host";
-constexpr const char* K_SRV_DEVID = "srv_devid";
-constexpr const char* K_SRV_TOKEN = "srv_token";
+constexpr const char* K_WIFI_SSID    = "wifi_ssid";
+constexpr const char* K_WIFI_PW      = "wifi_pw";
+constexpr const char* K_SRV_HOST     = "srv_host";
+constexpr const char* K_SRV_DEVID    = "srv_devid";
+constexpr const char* K_SRV_TOKEN    = "srv_token";
+constexpr const char* K_PAIR_SKIPPED = "pair_skipped";   // "1" if user chose standalone mode
 
 // Read a null-terminated string. Returns false if the key is missing
 // or any read error occurs. `out` is set to "" on failure.
@@ -88,7 +89,22 @@ bool clearServerConfig() {
   kv_remove(K_SRV_HOST);
   kv_remove(K_SRV_DEVID);
   kv_remove(K_SRV_TOKEN);
+  kv_remove(K_PAIR_SKIPPED);   // Re-pair also re-enables the pairing screen on next boot
   return true;
+}
+
+// ── Standalone mode flag ──────────────────────────────────────────────────
+// True if the user chose Skip on the pairing screen and wants to run the
+// controller without a server.
+
+bool loadPairSkipped() {
+  char buf[2] = "";
+  if (!_getString(K_PAIR_SKIPPED, buf, sizeof(buf))) return false;
+  return buf[0] == '1';
+}
+
+bool savePairSkipped() {
+  return _setString(K_PAIR_SKIPPED, "1");
 }
 
 }  // namespace storage

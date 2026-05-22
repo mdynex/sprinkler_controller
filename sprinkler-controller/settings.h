@@ -20,6 +20,9 @@
 
 // Defined in sprinkler-controller.ino — regenerates claimSecret + claimCode.
 extern void generateClaimSecret();
+// Defined in pairing.h — must be called whenever the secret regenerates so the
+// cached QR is rebuilt with the new value on the next paint.
+void invalidatePairingQR();
 
 namespace settings {
 
@@ -74,6 +77,7 @@ void handleSettingsTouch(int tx, int ty) {
           deviceId[0]    = '\0';
           deviceToken[0] = '\0';
           generateClaimSecret();
+          invalidatePairingQR();   // re-encode QR with the new secret
           deviceState   = STATE_PAIRING;
           currentScreen = SCR_PAIRING;
           needsRedraw   = true;

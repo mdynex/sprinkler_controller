@@ -48,10 +48,17 @@ static bool   _cancelable       = false;      // show CANCEL button in list
 static bool   _connectInFlight  = false;      // guard against re-entrant connect
 
 // ── Keyboard geometry ─────────────────────────────────────────────────────
+// Layout budget (800×480 screen):
+//   header        ...50
+//   SSID label    50..70
+//   password box  70..150       (height 80, fillRect clears 60..160)
+//   keyboard     160..360       (4 rows × 50 px + 3 gaps × 4 = 212 px)
+//   nav bar      370..440
+//   status bar   440..480
 constexpr int KB_W      = 75;
-constexpr int KB_H      = 55;
-constexpr int KB_GAP    = 5;
-constexpr int KB_Y_BASE = 175;   // first row y (below SSID + password field)
+constexpr int KB_H      = 50;
+constexpr int KB_GAP    = 4;
+constexpr int KB_Y_BASE = 160;   // first row y, just below the password field
 
 // Layout per row
 static const char* _row1Lower = "qwertyuiop";
@@ -225,24 +232,26 @@ void handleListTouch(int tx, int ty) {
 // ── Password screen ───────────────────────────────────────────────────────
 
 static void _drawPasswordField() {
-  // SSID label
-  gfx.fillRect(0, HDR_H, SCR_W, 70, C_BG);
+  // Clear the whole area above the keyboard so partial repaints don't leave
+  // stale pixels behind.
+  gfx.fillRect(0, HDR_H, SCR_W, KB_Y_BASE - HDR_H, C_BG);
+
+  // SSID label (y = 55, just below the header)
   gfx.setTextColor(C_DIM); gfx.setTextSize(1);
-  gfx.setCursor(20, HDR_H + 10);
+  gfx.setCursor(20, HDR_H + 5);
   gfx.print("Connecting to:");
   gfx.setTextColor(C_WHITE); gfx.setTextSize(2);
-  gfx.setCursor(20, HDR_H + 26);
+  gfx.setCursor(20, HDR_H + 22);
   gfx.print(_selectedSsid);
 
-  // Password input box
-  int pwY = HDR_H + 70;
-  gfx.fillRect(0, pwY, SCR_W, 90, C_BG);
-  gfx.fillRoundRect(20, pwY + 10, SCR_W - 40, 60, 6, C_DARKGRAY);
+  // Password input box (y = 95, height 45, clears y = 95..140)
+  int boxY = HDR_H + 45;
+  gfx.fillRoundRect(20, boxY, SCR_W - 40, 45, 6, C_DARKGRAY);
 
   String shown;
   for (int i = 0; i < _passwordLen; i++) shown += '*';
   gfx.setTextColor(C_WHITE); gfx.setTextSize(3);
-  gfx.setCursor(35, pwY + 30);
+  gfx.setCursor(35, boxY + 11);
   gfx.print(shown);
 }
 

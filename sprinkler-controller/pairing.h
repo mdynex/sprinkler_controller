@@ -30,7 +30,16 @@
 // ── QR object (initialised lazily on first draw) ───────────────────────────
 static QRCode _qr;
 static const uint8_t _QR_VERSION = 5;     // 37×37 modules, ~106 bytes capacity at ECC_LOW
-static uint8_t _qrBuf[qrcode_getBufferSize(_QR_VERSION)];
+
+// qrcode_getBufferSize() is a runtime function on this toolchain, so we can't
+// use it as a compile-time array bound. Compute the same value via constexpr:
+//   side = 4*version + 17     (37 at v=5)
+//   bytes = (side*side + 7) / 8   (172 at v=5)
+constexpr int _qrSideForVersion(int v)  { return 4 * v + 17; }
+constexpr int _qrBufBytesForVersion(int v) {
+    return (_qrSideForVersion(v) * _qrSideForVersion(v) + 7) / 8;
+}
+static uint8_t _qrBuf[_qrBufBytesForVersion(_QR_VERSION)];
 static bool _qrReady = false;
 
 // Replace spaces with '+' so the QR payload stays URL-safe without %-encoding.
@@ -47,6 +56,10 @@ static void _initPairingQR() {
   qrcode_initText(&_qr, _qrBuf, _QR_VERSION, ECC_LOW, url.c_str());
   _qrReady = true;
 }
+
+// Public: invalidate the cached QR so the next paint re-encodes the current
+// claimSecret. Call this whenever generateClaimSecret() runs (e.g. Re-pair).
+void invalidatePairingQR() { _qrReady = false; }
 
 // ── Screen drawing ──────────────────────────────────────────────────────────
 
@@ -95,19 +108,30 @@ void _drawPairingScreen() {
   const char* line1 = "Open the app -> Add Device -> Scan QR or enter code";
   gfx.setTextColor(C_DIM); gfx.setTextSize(1);
   int t1w = strlen(line1) * 6;
-  gfx.setCursor((SCR_W - t1w) / 2, qrY + qrW + 70);
+  gfx.setCursor((SCR_W - t1w) / 2, qrY + qrW + 60);
   gfx.print(line1);
+
+  // Skip button — local-only mode without server pairing
+  gfx.fillRect(0, NAV_Y, SCR_W, NAV_H, C_BG);
+  _btn(SCR_W - 260, NAV_Y + 10, 240, 50, C_GRAY, "SKIP FOR NOW", 2);
 
   // Bottom status line
   gfx.fillRect(0, STS_Y, SCR_W, STS_H, C_BLACK);
   gfx.setTextColor(C_DIM); gfx.setTextSize(1);
   gfx.setCursor(10, STS_Y + 14);
-  gfx.print("Waiting for app...");
+  gfx.print("Waiting for app...  (or skip to use without an app)");
 }
 
-void _handlePairingTouch(int /*tx*/, int /*ty*/) {
-  // Nothing to do — the screen is informational. Tapping just wakes the
-  // backlight (handled upstream in displayLoop).
+void _handlePairingTouch(int tx, int ty) {
+  // Skip → standalone mode. Persist the choice so we don't show the pairing
+  // screen again on the next reboot. Settings → Re-pair clears the flag.
+  if (_inRect(tx, ty, SCR_W - 260, NAV_Y + 10, 240, 50)) {
+    storage::savePairSkipped();
+    deviceState   = STATE_RUNNING;
+    currentScreen = SCR_HOME;
+    needsRedraw   = true;
+    Serial.println("[pairing] Skipped — standalone mode");
+  }
 }
 
 // ── POST /provision handler ─────────────────────────────────────────────────
@@ -119,6 +143,16 @@ void routeProvision(WiFiClient& client, HttpRequest& req) {
   }
   // Accept either form: QR encodes the full 16-hex `claimSecret`,
   // manual entry uses the 6-digit `claimCode`.
+  Serial.print("[provision] Received secret: '");
+  Serial.print(req.claimSecret);
+  Serial.print("' (len=");
+  Serial.print(req.claimSecret.length());
+  Serial.print(")  Expected secret: '");
+  Serial.print(claimSecret);
+  Serial.print("' code: '");
+  Serial.print(claimCode);
+  Serial.println("'");
+
   if (req.claimSecret != String(claimSecret) &&
       req.claimSecret != String(claimCode)) {
     sendResponse(client, 401, "{\"error\":\"invalid claim secret\"}");

@@ -124,17 +124,24 @@ void setup() {
 
   ntpInit();
 
-  // 2. Choose between RUNNING (already provisioned) and PAIRING (fresh device)
+  // 2. Boot routing:
+  //    - Server config present → STATE_RUNNING (paired)
+  //    - User skipped pairing earlier → STATE_RUNNING (standalone, no server)
+  //    - Otherwise → STATE_PAIRING (show QR + claim code)
   if (storage::loadServerConfig(serverHost, sizeof(serverHost),
                                 deviceId,   sizeof(deviceId),
                                 deviceToken, sizeof(deviceToken))) {
-    deviceState  = STATE_RUNNING;
+    deviceState   = STATE_RUNNING;
     currentScreen = SCR_HOME;
     Serial.print("[boot] Paired with server ");
     Serial.println(serverHost);
+  } else if (storage::loadPairSkipped()) {
+    deviceState   = STATE_RUNNING;
+    currentScreen = SCR_HOME;
+    Serial.println("[boot] Standalone mode (pairing skipped)");
   } else {
     generateClaimSecret();
-    deviceState  = STATE_PAIRING;
+    deviceState   = STATE_PAIRING;
     currentScreen = SCR_PAIRING;
     Serial.print("[boot] Unpaired — claim code: ");
     Serial.print(claimCode);

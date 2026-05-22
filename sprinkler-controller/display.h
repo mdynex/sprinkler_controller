@@ -48,6 +48,8 @@ enum Screen {
   SCR_SCHEDULES,
   SCR_EDIT,
   SCR_ZONE_SETTINGS,
+  SCR_NEW_SCHEDULE,       // Create-on-device schedule builder (step 1: time/zones/duration)
+  SCR_NEW_DAYS,           // Create-on-device schedule builder (step 2: days of week)
   SCR_PAIRING,            // STATE_PAIRING — QR + claim code
   SCR_WIFI_LIST,          // STATE_WIFI_SETUP — pick a network
   SCR_WIFI_PASSWORD,      // STATE_WIFI_SETUP — keyboard for the password
@@ -106,9 +108,17 @@ void _onTouch(uint8_t contacts, GDTpoint_t* pts) {
 }
 
 // ── Edit screen state ──────────────────────────────────────────────────────
-bool _editAutoRun = false;
-int  _editHour    = 6;
-int  _editMin     = 0;
+uint8_t _editDaysMask = 0;   // bit 0=Sun ... 6=Sat. 0 = manual only.
+int     _editHour     = 6;
+int     _editMin      = 0;
+int     _editStepsPage = 0;  // 0-indexed page of the zone step list
+
+// ── New-schedule builder state ─────────────────────────────────────────────
+bool    _newZones[ZONE_COUNT] = {false};
+int     _newDuration          = 10;  // minutes, 1..120
+int     _newHour              = 6;
+int     _newMin               = 0;
+uint8_t _newDaysMask          = 0x7F;  // default to all days
 
 // ── Zone Settings paging ───────────────────────────────────────────────────
 #define ZS_ZONES_PER_PAGE  4
@@ -117,15 +127,17 @@ int _zoneSettingsPage = 0;   // 0 = zones 1-4, 1 = zones 5-8, etc.
 // Load only the auto-run settings from the schedule into edit state.
 // Zone steps are managed by the app and are not editable on the display.
 void _loadEditState() {
-  _editAutoRun = theSchedule.autoRun;
-  _editHour    = theSchedule.runHour;
-  _editMin     = theSchedule.runMinute;
+  _editDaysMask  = theSchedule.daysMask;
+  _editHour      = theSchedule.runHour;
+  _editMin       = theSchedule.runMinute;
+  _editStepsPage = 0;
 }
 
 // Save only the auto-run settings back to the schedule.
 // Zone steps are left untouched.
 void _saveEditState() {
-  theSchedule.autoRun   = _editAutoRun;
+  theSchedule.daysMask  = _editDaysMask;
+  theSchedule.autoRun   = (_editDaysMask != 0);
   theSchedule.runHour   = _editHour;
   theSchedule.runMinute = _editMin;
 }
@@ -164,8 +176,9 @@ void _btn(int x, int y, int w, int h, uint16_t color, const char* lbl, int sz = 
 // ── Common elements ────────────────────────────────────────────────────────
 
 // Hit-test region for the home-screen "Settings" icon in the header.
-// Defined here so _handleHomeTouch (below) can reuse the same coordinates.
-constexpr int HDR_MENU_X = 720;   // x of menu icon (3 bars)
+// The clock occupies x = ~725..785 (5 chars × 12 px at size 2, anchored to
+// the right edge with a 15 px margin), so place the menu icon clear of it.
+constexpr int HDR_MENU_X = 670;   // x of menu icon (3 bars). Right edge = 702.
 constexpr int HDR_MENU_Y = 14;
 constexpr int HDR_MENU_W = 32;
 constexpr int HDR_MENU_H = 22;
@@ -309,6 +322,53 @@ void _handleHomeTouch(int tx, int ty) {
   }
 }
 
+// ── Day-toggle row primitives (used by SCHEDULES, EDIT, NEW SCHEDULE) ──────
+constexpr int DAY_W   = 80;
+constexpr int DAY_H   = 35;
+constexpr int DAY_GAP = 5;
+constexpr int DAY_X0  = 20;
+
+void _drawDaysRow(int yBase, uint8_t mask) {
+  const char* labels[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+  for (int d = 0; d < 7; d++) {
+    int x = DAY_X0 + d * (DAY_W + DAY_GAP);
+    bool on = (mask >> d) & 1;
+    _btn(x, yBase, DAY_W, DAY_H,
+         on ? C_GREEN : C_DARKGRAY,
+         labels[d], 1,
+         on ? C_BLACK : C_WHITE);
+  }
+}
+
+// If (tx,ty) falls on a day toggle within `yBase`, return the day index 0..6;
+// otherwise return -1.
+int _hitDay(int tx, int ty, int yBase) {
+  if (ty < yBase || ty >= yBase + DAY_H) return -1;
+  for (int d = 0; d < 7; d++) {
+    int x = DAY_X0 + d * (DAY_W + DAY_GAP);
+    if (tx >= x && tx <= x + DAY_W) return d;
+  }
+  return -1;
+}
+
+// Format a daysMask as a friendly summary string ("Daily", "Weekdays", or
+// individual initials joined by spaces).
+void _formatDaysMask(uint8_t mask, char* out, size_t outLen) {
+  if (outLen == 0) return;
+  if (mask == 0)    { strncpy(out, "Manual only", outLen - 1); out[outLen-1]=0; return; }
+  if (mask == 0x7F) { strncpy(out, "Every day",   outLen - 1); out[outLen-1]=0; return; }
+  if (mask == 0x3E) { strncpy(out, "Weekdays",    outLen - 1); out[outLen-1]=0; return; }
+  if (mask == 0x41) { strncpy(out, "Weekends",    outLen - 1); out[outLen-1]=0; return; }
+  const char* initials[] = {"Su","Mo","Tu","We","Th","Fr","Sa"};
+  out[0] = '\0';
+  for (int d = 0; d < 7; d++) {
+    if ((mask >> d) & 1) {
+      if (out[0] != '\0' && strlen(out) + 2 < outLen) strcat(out, " ");
+      if (strlen(out) + 3 < outLen) strcat(out, initials[d]);
+    }
+  }
+}
+
 // ── SCHEDULES screen ───────────────────────────────────────────────────────
 
 #define SL_ROW_H    55
@@ -327,12 +387,16 @@ void _drawSchedRow(int screenRow) {
   gfx.print(theSchedule.name);
 
   gfx.setTextSize(1);
-  gfx.setTextColor(theSchedule.autoRun ? C_ORANGE : C_DIM);
+  gfx.setTextColor(theSchedule.daysMask != 0 ? C_ORANGE : C_DIM);
   gfx.setCursor(20, y + 36);
-  if (theSchedule.autoRun) {
-    char buf[12];
-    snprintf(buf, sizeof(buf), "Daily %02d:%02d", theSchedule.runHour, theSchedule.runMinute);
-    gfx.print(buf);
+  if (theSchedule.daysMask != 0) {
+    char days[32];
+    _formatDaysMask(theSchedule.daysMask, days, sizeof(days));
+    gfx.print(days);
+    gfx.print("  ");
+    char tbuf[8];
+    snprintf(tbuf, sizeof(tbuf), "%02d:%02d", theSchedule.runHour, theSchedule.runMinute);
+    gfx.print(tbuf);
   } else {
     gfx.print("Manual only");
   }
@@ -358,8 +422,13 @@ void _drawSchedulesScreen() {
     gfx.setTextSize(2);
     gfx.setCursor(20, HDR_H + 40);
     gfx.print("No schedule yet.");
+    gfx.setTextSize(1);
     gfx.setCursor(20, HDR_H + 70);
-    gfx.print("Send one from the app, then tap it here to configure.");
+    gfx.print("Create one on this device, or send one from the app.");
+
+    // Big tappable CREATE button in the centre
+    _btn(SCR_W / 2 - 175, HDR_H + 110, 350, 70, C_BLUE,
+         "+ CREATE NEW SCHEDULE", 2);
   }
   gfx.fillRect(0, NAV_Y, SCR_W, NAV_H, C_BG);
   _btn(20,          NAV_Y + 10, 160, 50, C_GRAY, "BACK");
@@ -378,7 +447,20 @@ void _handleSchedulesTouch(int tx, int ty) {
     return;
   }
 
-  if (!theSchedule.used) return;
+  if (!theSchedule.used) {
+    // CREATE NEW SCHEDULE button (only visible when there's no schedule)
+    if (_inRect(tx, ty, SCR_W / 2 - 175, HDR_H + 110, 350, 70)) {
+      // Reset builder state to sensible defaults
+      for (int i = 0; i < ZONE_COUNT; i++) _newZones[i] = false;
+      _newDuration = 10;
+      _newHour     = 6;
+      _newMin      = 0;
+      _newDaysMask = 0x7F;   // default to every day (user can refine on step 2)
+      currentScreen = SCR_NEW_SCHEDULE;
+      needsRedraw = true;
+    }
+    return;
+  }
   int y = SL_LIST_Y;
 
   // Run/Stop button — redraw just the row + status bar
@@ -398,11 +480,23 @@ void _handleSchedulesTouch(int tx, int ty) {
 }
 
 // ── EDIT screen ────────────────────────────────────────────────────────────
-// The display can only toggle auto-run on/off and change the run time.
-// Zone steps are defined by the app and are shown here as read-only info.
+// Shows the full zone-step list, day-of-week toggles, time, and DELETE.
+//
+// TODO: distinguish between server-sent schedules (complex multi-zone
+//       multi-cycle structures generated by the recommendation engine) and
+//       on-device schedules built via SCR_NEW_SCHEDULE. For server schedules
+//       we should treat the step list as read-only (server owns it) and only
+//       expose time/days/DELETE. For on-device schedules the user should be
+//       able to edit zones + duration too. Add a `Schedule.origin` field
+//       ("server" | "device") or check `name` to gate this.
 
-#define ED_BTN_Y  (HDR_H + 120)   // y position of auto-run controls
-#define ED_BTN_H  50
+#define ED_STEPS_Y    (HDR_H + 30)   // y of the "ZONES (...)" header row
+#define ED_ROW_OFF    30             // first step row sits this far below header
+#define ED_STEP_H     28
+#define ED_STEPS_MAX  4              // 4 steps per page (leaves room for days)
+#define ED_DAYS_Y     (HDR_H + 170)  // 7 day toggles (35 tall)
+#define ED_BTN_Y      (HDR_H + 215)  // y of time row
+#define ED_BTN_H      50
 
 void _drawEditScreen() {
   gfx.fillScreen(C_BG);
@@ -410,92 +504,140 @@ void _drawEditScreen() {
   snprintf(title, sizeof(title), "EDIT: %s", theSchedule.name);
   _drawHeader(title);
 
-  // Read-only zone step count
-  gfx.setTextColor(C_DIM);
-  gfx.setTextSize(2);
-  gfx.setCursor(20, HDR_H + 30);
-  char info[32];
-  snprintf(info, sizeof(info), "%d step%s (set by app)",
-           theSchedule.stepCount, theSchedule.stepCount == 1 ? "" : "s");
-  gfx.print(info);
+  // Zone step list — paginated. ED_STEPS_MAX steps per page.
+  int totalSteps = theSchedule.stepCount;
+  int totalPages = totalSteps == 0 ? 1 : (totalSteps + ED_STEPS_MAX - 1) / ED_STEPS_MAX;
+  if (_editStepsPage >= totalPages) _editStepsPage = totalPages - 1;
+  int startIdx = _editStepsPage * ED_STEPS_MAX;
+  int endIdx   = startIdx + ED_STEPS_MAX;
+  if (endIdx > totalSteps) endIdx = totalSteps;
 
-  // Divider
-  gfx.drawFastHLine(20, HDR_H + 65, SCR_W - 40, C_GRAY);
+  gfx.setTextColor(C_DIM); gfx.setTextSize(1);
+  gfx.setCursor(20, ED_STEPS_Y);
+  gfx.print("ZONES (");
+  gfx.print(totalSteps);
+  gfx.print(" steps):");
 
-  // Auto-run toggle
-  gfx.setTextColor(C_WHITE);
-  gfx.setTextSize(2);
-  gfx.setCursor(20, ED_BTN_Y - 25);
-  gfx.print("Auto-run");
-
-  _btn(20, ED_BTN_Y, 160, ED_BTN_H,
-       _editAutoRun ? C_GREEN : C_GRAY,
-       _editAutoRun ? "AUTO ON" : "AUTO OFF", 2,
-       _editAutoRun ? C_BLACK : C_WHITE);
-
-  if (_editAutoRun) {
-    gfx.setTextColor(C_DIM);
-    gfx.setTextSize(2);
-    gfx.setCursor(205, ED_BTN_Y + (ED_BTN_H - 16) / 2);
-    gfx.print("Run at:");
-
-    // Hour [-] HH [+]
-    _btn(330, ED_BTN_Y, ED_BTN_H, ED_BTN_H, C_GRAY, "-");
-    char hbuf[3];
-    snprintf(hbuf, sizeof(hbuf), "%02d", _editHour);
-    gfx.setTextColor(C_WHITE);
-    gfx.setTextSize(3);
-    gfx.setCursor(392, ED_BTN_Y + (ED_BTN_H - 24) / 2);
-    gfx.print(hbuf);
-    _btn(430, ED_BTN_Y, ED_BTN_H, ED_BTN_H, C_GRAY, "+");
-
-    gfx.setTextSize(3);
-    gfx.setTextColor(C_DIM);
-    gfx.setCursor(492, ED_BTN_Y + (ED_BTN_H - 24) / 2);
-    gfx.print(":");
-
-    // Minute [-] MM [+]
-    _btn(515, ED_BTN_Y, ED_BTN_H, ED_BTN_H, C_GRAY, "-");
-    char mbuf[3];
-    snprintf(mbuf, sizeof(mbuf), "%02d", _editMin);
-    gfx.setTextColor(C_WHITE);
-    gfx.setTextSize(3);
-    gfx.setCursor(577, ED_BTN_Y + (ED_BTN_H - 24) / 2);
-    gfx.print(mbuf);
-    _btn(615, ED_BTN_Y, ED_BTN_H, ED_BTN_H, C_GRAY, "+");
+  // Pagination controls on the right edge of the header row
+  if (totalPages > 1) {
+    char pageLbl[12];
+    snprintf(pageLbl, sizeof(pageLbl), "Page %d/%d", _editStepsPage + 1, totalPages);
+    gfx.setTextColor(C_DIM); gfx.setTextSize(1);
+    int lw = strlen(pageLbl) * 6;
+    gfx.setCursor(SCR_W - 200 - lw / 2, ED_STEPS_Y);
+    gfx.print(pageLbl);
+    if (_editStepsPage > 0)
+      _btn(SCR_W - 280, ED_STEPS_Y - 6, 60, 30, C_GRAY, "<", 2);
+    if (_editStepsPage < totalPages - 1)
+      _btn(SCR_W - 110, ED_STEPS_Y - 6, 60, 30, C_GRAY, ">", 2);
   }
 
+  for (int i = startIdx; i < endIdx; i++) {
+    int row = i - startIdx;
+    int y   = ED_STEPS_Y + ED_ROW_OFF + row * ED_STEP_H;
+    char line[40];
+    int mins = theSchedule.steps[i].duration / 60;
+    int secs = theSchedule.steps[i].duration % 60;
+    if (secs == 0) {
+      snprintf(line, sizeof(line), "  %d. Zone %d:  %d min",
+               i + 1, theSchedule.steps[i].zoneId, mins);
+    } else {
+      snprintf(line, sizeof(line), "  %d. Zone %d:  %d:%02d",
+               i + 1, theSchedule.steps[i].zoneId, mins, secs);
+    }
+    gfx.setTextColor(C_WHITE); gfx.setTextSize(2);
+    gfx.setCursor(20, y);
+    gfx.print(line);
+  }
+
+  // Days of week — tap to toggle each. Empty mask = manual only.
+  gfx.setTextColor(C_DIM); gfx.setTextSize(1);
+  gfx.setCursor(20, ED_DAYS_Y - 12);
+  gfx.print("DAYS TO RUN:");
+  _drawDaysRow(ED_DAYS_Y, _editDaysMask);
+
+  // Time row — start time (always shown; relevant when any day is selected)
+  gfx.setTextColor(C_DIM); gfx.setTextSize(2);
+  gfx.setCursor(20, ED_BTN_Y + (ED_BTN_H - 16) / 2);
+  gfx.print("Start:");
+
+  _btn(120, ED_BTN_Y, ED_BTN_H, ED_BTN_H, C_GRAY, "-");
+  char hbuf[3]; snprintf(hbuf, sizeof(hbuf), "%02d", _editHour);
+  gfx.setTextColor(C_WHITE); gfx.setTextSize(3);
+  gfx.setCursor(182, ED_BTN_Y + (ED_BTN_H - 24) / 2);
+  gfx.print(hbuf);
+  _btn(220, ED_BTN_Y, ED_BTN_H, ED_BTN_H, C_GRAY, "+");
+
+  gfx.setTextSize(3); gfx.setTextColor(C_DIM);
+  gfx.setCursor(282, ED_BTN_Y + (ED_BTN_H - 24) / 2);
+  gfx.print(":");
+
+  _btn(305, ED_BTN_Y, ED_BTN_H, ED_BTN_H, C_GRAY, "-");
+  char mbuf[3]; snprintf(mbuf, sizeof(mbuf), "%02d", _editMin);
+  gfx.setTextColor(C_WHITE); gfx.setTextSize(3);
+  gfx.setCursor(367, ED_BTN_Y + (ED_BTN_H - 24) / 2);
+  gfx.print(mbuf);
+  _btn(405, ED_BTN_Y, ED_BTN_H, ED_BTN_H, C_GRAY, "+");
+
+  // Nav bar: CANCEL | SAVE | DELETE | RUN NOW
   gfx.fillRect(0, NAV_Y, SCR_W, NAV_H, C_BG);
-  _btn(20,          NAV_Y + 10, 160, 50, C_GRAY,  "CANCEL");
-  _btn(320,         NAV_Y + 10, 160, 50, C_BLUE,  "SAVE");
-  _btn(SCR_W - 200, NAV_Y + 10, 180, 50, C_GREEN, "RUN NOW", 2, C_BLACK);
+  _btn(10,  NAV_Y + 10, 130, 50, C_GRAY,  "CANCEL", 2);
+  _btn(150, NAV_Y + 10, 130, 50, C_BLUE,  "SAVE",   2);
+  _btn(290, NAV_Y + 10, 130, 50, C_RED,   "DELETE", 2);
+  _btn(600, NAV_Y + 10, 190, 50, C_GREEN, "RUN NOW", 2, C_BLACK);
   _drawStatusBar();
 }
 
 void _handleEditTouch(int tx, int ty) {
-  if (_inRect(tx, ty, 20, NAV_Y + 10, 160, 50)) {
+  // CANCEL
+  if (_inRect(tx, ty, 10, NAV_Y + 10, 130, 50)) {
     currentScreen = SCR_SCHEDULES; needsRedraw = true; return;
   }
-  if (_inRect(tx, ty, 320, NAV_Y + 10, 160, 50)) {
+  // SAVE
+  if (_inRect(tx, ty, 150, NAV_Y + 10, 130, 50)) {
     _saveEditState(); currentScreen = SCR_SCHEDULES; needsRedraw = true; return;
   }
-  if (_inRect(tx, ty, SCR_W - 200, NAV_Y + 10, 180, 50)) {
+  // DELETE
+  if (_inRect(tx, ty, 290, NAV_Y + 10, 130, 50)) {
+    if (runState.running) stopSchedule();
+    theSchedule.used = false;
+    theSchedule.stepCount = 0;
+    currentScreen = SCR_SCHEDULES;
+    needsRedraw = true;
+    return;
+  }
+  // RUN NOW
+  if (_inRect(tx, ty, 600, NAV_Y + 10, 190, 50)) {
     _saveEditState(); startSchedule(); currentScreen = SCR_HOME; needsRedraw = true; return;
   }
 
-  // Auto-run toggle
-  if (_inRect(tx, ty, 20, ED_BTN_Y, 160, ED_BTN_H)) {
-    _editAutoRun = !_editAutoRun; needsRedraw = true; return;
+  // Pagination (only valid when more than one page exists)
+  int totalPages = theSchedule.stepCount == 0 ? 1
+                 : (theSchedule.stepCount + ED_STEPS_MAX - 1) / ED_STEPS_MAX;
+  if (totalPages > 1) {
+    if (_editStepsPage > 0 &&
+        _inRect(tx, ty, SCR_W - 280, ED_STEPS_Y - 6, 60, 30)) {
+      _editStepsPage--; needsRedraw = true; return;
+    }
+    if (_editStepsPage < totalPages - 1 &&
+        _inRect(tx, ty, SCR_W - 110, ED_STEPS_Y - 6, 60, 30)) {
+      _editStepsPage++; needsRedraw = true; return;
+    }
   }
 
-  if (_editAutoRun) {
-    // Hour
-    if (_inRect(tx, ty, 330, ED_BTN_Y, ED_BTN_H, ED_BTN_H)) { _editHour = (_editHour + 23) % 24; needsRedraw = true; return; }
-    if (_inRect(tx, ty, 430, ED_BTN_Y, ED_BTN_H, ED_BTN_H)) { _editHour = (_editHour +  1) % 24; needsRedraw = true; return; }
-    // Minute
-    if (_inRect(tx, ty, 515, ED_BTN_Y, ED_BTN_H, ED_BTN_H)) { _editMin  = (_editMin  + 55) % 60; needsRedraw = true; return; }
-    if (_inRect(tx, ty, 615, ED_BTN_Y, ED_BTN_H, ED_BTN_H)) { _editMin  = (_editMin  +  5) % 60; needsRedraw = true; return; }
+  // Day-of-week toggles
+  int day = _hitDay(tx, ty, ED_DAYS_Y);
+  if (day >= 0) {
+    _editDaysMask ^= (uint8_t)(1 << day);
+    needsRedraw = true;
+    return;
   }
+
+  // Time controls
+  if (_inRect(tx, ty, 120, ED_BTN_Y, ED_BTN_H, ED_BTN_H)) { _editHour = (_editHour + 23) % 24; needsRedraw = true; return; }
+  if (_inRect(tx, ty, 220, ED_BTN_Y, ED_BTN_H, ED_BTN_H)) { _editHour = (_editHour +  1) % 24; needsRedraw = true; return; }
+  if (_inRect(tx, ty, 305, ED_BTN_Y, ED_BTN_H, ED_BTN_H)) { _editMin  = (_editMin  + 55) % 60; needsRedraw = true; return; }
+  if (_inRect(tx, ty, 405, ED_BTN_Y, ED_BTN_H, ED_BTN_H)) { _editMin  = (_editMin  +  5) % 60; needsRedraw = true; return; }
 }
 
 // ── ZONE SETTINGS screen ───────────────────────────────────────────────────
@@ -614,6 +756,271 @@ void _handleZoneSettingsTouch(int tx, int ty) {
   }
 }
 
+// ── NEW SCHEDULE screen ───────────────────────────────────────────────────
+// Compose a simple schedule on-device:
+//   • Start time (HH:MM)              auto-run toggle
+//   • One global duration per zone
+//   • 8 zone toggles (2 × 4 grid)
+// SAVE assembles `theSchedule` from the selected zones (in numeric order)
+// using `_newDuration` for every step.
+
+#define NS_TIME_Y    (HDR_H + 10)
+#define NS_DUR_Y     (HDR_H + 75)
+#define NS_GRID_Y    (HDR_H + 145)
+#define NS_BTN_H     50
+
+void _drawNewScheduleScreen() {
+  gfx.fillScreen(C_BG);
+  _drawHeader("NEW SCHEDULE");
+
+  // ── Start time row ──
+  gfx.setTextColor(C_DIM); gfx.setTextSize(2);
+  gfx.setCursor(20, NS_TIME_Y + 15);
+  gfx.print("Start:");
+
+  _btn(105, NS_TIME_Y, NS_BTN_H, NS_BTN_H, C_GRAY, "-");
+  char hbuf[3]; snprintf(hbuf, sizeof(hbuf), "%02d", _newHour);
+  gfx.setTextColor(C_WHITE); gfx.setTextSize(3);
+  gfx.setCursor(167, NS_TIME_Y + (NS_BTN_H - 24) / 2);
+  gfx.print(hbuf);
+  _btn(205, NS_TIME_Y, NS_BTN_H, NS_BTN_H, C_GRAY, "+");
+
+  gfx.setTextColor(C_DIM); gfx.setTextSize(3);
+  gfx.setCursor(267, NS_TIME_Y + (NS_BTN_H - 24) / 2);
+  gfx.print(":");
+
+  _btn(290, NS_TIME_Y, NS_BTN_H, NS_BTN_H, C_GRAY, "-");
+  char mbuf[3]; snprintf(mbuf, sizeof(mbuf), "%02d", _newMin);
+  gfx.setTextColor(C_WHITE); gfx.setTextSize(3);
+  gfx.setCursor(352, NS_TIME_Y + (NS_BTN_H - 24) / 2);
+  gfx.print(mbuf);
+  _btn(390, NS_TIME_Y, NS_BTN_H, NS_BTN_H, C_GRAY, "+");
+
+  // Right side of time row reserved (days are configured on the next screen)
+  gfx.setTextColor(C_DIM); gfx.setTextSize(1);
+  gfx.setCursor(525, NS_TIME_Y + 5);
+  gfx.print("Pick days on the next screen");
+
+  // ── Duration row ──
+  gfx.setTextColor(C_DIM); gfx.setTextSize(2);
+  gfx.setCursor(20, NS_DUR_Y + 15);
+  gfx.print("Each zone:");
+
+  _btn(190, NS_DUR_Y, NS_BTN_H, NS_BTN_H, C_GRAY, "-");
+  char dbuf[5]; snprintf(dbuf, sizeof(dbuf), "%d", _newDuration);
+  gfx.setTextColor(C_WHITE); gfx.setTextSize(3);
+  int dw = strlen(dbuf) * 18;
+  gfx.setCursor(252 + (60 - dw) / 2, NS_DUR_Y + (NS_BTN_H - 24) / 2);
+  gfx.print(dbuf);
+  _btn(310, NS_DUR_Y, NS_BTN_H, NS_BTN_H, C_GRAY, "+");
+
+  gfx.setTextColor(C_DIM); gfx.setTextSize(2);
+  gfx.setCursor(375, NS_DUR_Y + 15);
+  gfx.print("minutes");
+
+  // ── Zone grid (2 rows × 4 cols) ──
+  gfx.setTextColor(C_DIM); gfx.setTextSize(1);
+  gfx.setCursor(20, NS_GRID_Y - 12);
+  gfx.print("ZONES TO RUN:");
+
+  const int cellW = 180;
+  const int cellH = 75;
+  const int gap   = 10;
+  for (int i = 0; i < ZONE_COUNT; i++) {
+    int col = i % 4;
+    int row = i / 4;
+    int x = 20 + col * (cellW + gap);
+    int y = NS_GRID_Y + row * (cellH + gap);
+    bool on = _newZones[i];
+    char lbl[16];
+    snprintf(lbl, sizeof(lbl), "Zone %d", i + 1);
+    _btn(x, y, cellW, cellH, on ? C_GREEN : C_DARKGRAY,
+         lbl, 2, on ? C_BLACK : C_WHITE);
+  }
+
+  // ── Nav ──
+  gfx.fillRect(0, NAV_Y, SCR_W, NAV_H, C_BG);
+  _btn(20,          NAV_Y + 10, 160, 50, C_GRAY,  "CANCEL");
+  _btn(SCR_W - 200, NAV_Y + 10, 180, 50, C_BLUE,  "NEXT >", 2);
+
+  // ── Status ──
+  gfx.fillRect(0, STS_Y, SCR_W, STS_H, C_BLACK);
+  int selected = 0;
+  for (int i = 0; i < ZONE_COUNT; i++) if (_newZones[i]) selected++;
+  gfx.setTextColor(C_DIM); gfx.setTextSize(1);
+  gfx.setCursor(10, STS_Y + 14);
+  gfx.print(selected); gfx.print(" zone(s) selected");
+  if (selected > 0) {
+    gfx.print("  |  Total: ");
+    gfx.print(selected * _newDuration);
+    gfx.print(" min");
+  }
+}
+
+void _handleNewScheduleTouch(int tx, int ty) {
+  // CANCEL
+  if (_inRect(tx, ty, 20, NAV_Y + 10, 160, 50)) {
+    currentScreen = SCR_SCHEDULES; needsRedraw = true; return;
+  }
+  // NEXT → continue to day picker. Require at least one zone selected.
+  if (_inRect(tx, ty, SCR_W - 200, NAV_Y + 10, 180, 50)) {
+    int n = 0;
+    for (int i = 0; i < ZONE_COUNT; i++) if (_newZones[i]) n++;
+    if (n == 0) return;   // nothing selected → ignore tap
+    currentScreen = SCR_NEW_DAYS;
+    needsRedraw = true;
+    return;
+  }
+
+  // Start time controls
+  if (_inRect(tx, ty, 105, NS_TIME_Y, NS_BTN_H, NS_BTN_H)) { _newHour = (_newHour + 23) % 24; needsRedraw = true; return; }
+  if (_inRect(tx, ty, 205, NS_TIME_Y, NS_BTN_H, NS_BTN_H)) { _newHour = (_newHour +  1) % 24; needsRedraw = true; return; }
+  if (_inRect(tx, ty, 290, NS_TIME_Y, NS_BTN_H, NS_BTN_H)) { _newMin  = (_newMin  + 55) % 60; needsRedraw = true; return; }
+  if (_inRect(tx, ty, 390, NS_TIME_Y, NS_BTN_H, NS_BTN_H)) { _newMin  = (_newMin  +  5) % 60; needsRedraw = true; return; }
+
+  // Duration -/+
+  if (_inRect(tx, ty, 190, NS_DUR_Y, NS_BTN_H, NS_BTN_H)) {
+    if (_newDuration > 1) _newDuration--;
+    needsRedraw = true; return;
+  }
+  if (_inRect(tx, ty, 310, NS_DUR_Y, NS_BTN_H, NS_BTN_H)) {
+    if (_newDuration < 120) _newDuration++;
+    needsRedraw = true; return;
+  }
+
+  // Zone toggles
+  const int cellW = 180;
+  const int cellH = 75;
+  const int gap   = 10;
+  for (int i = 0; i < ZONE_COUNT; i++) {
+    int col = i % 4;
+    int row = i / 4;
+    int x = 20 + col * (cellW + gap);
+    int y = NS_GRID_Y + row * (cellH + gap);
+    if (_inRect(tx, ty, x, y, cellW, cellH)) {
+      _newZones[i] = !_newZones[i];
+      needsRedraw = true;
+      return;
+    }
+  }
+}
+
+// ── NEW SCHEDULE — step 2: pick days of week ──────────────────────────────
+// User tapped NEXT on the previous screen. Pick which days the schedule
+// should auto-run on (or none for manual only) and SAVE to commit.
+
+#define ND_DAYS_Y    (HDR_H + 100)   // y of the day toggle row
+#define ND_PRESETS_Y (HDR_H + 200)   // y of the preset shortcut buttons
+
+void _drawNewDaysScreen() {
+  gfx.fillScreen(C_BG);
+  _drawHeader("WHEN TO RUN");
+
+  // Summary of step 1's settings (read-only recap)
+  int selected = 0;
+  for (int i = 0; i < ZONE_COUNT; i++) if (_newZones[i]) selected++;
+  char recap[80];
+  snprintf(recap, sizeof(recap), "Starts %02d:%02d  -  %d zone(s) x %d min  =  %d min total",
+           _newHour, _newMin, selected, _newDuration, selected * _newDuration);
+  gfx.setTextColor(C_DIM); gfx.setTextSize(1);
+  gfx.setCursor(20, HDR_H + 15);
+  gfx.print(recap);
+
+  // Section label
+  gfx.setTextColor(C_WHITE); gfx.setTextSize(2);
+  gfx.setCursor(20, HDR_H + 50);
+  gfx.print("Pick days to auto-run:");
+  gfx.setTextColor(C_DIM); gfx.setTextSize(1);
+  gfx.setCursor(20, HDR_H + 75);
+  gfx.print("(leave all off for manual-only)");
+
+  // 7 day toggles
+  _drawDaysRow(ND_DAYS_Y, _newDaysMask);
+
+  // Preset shortcut buttons
+  gfx.setTextColor(C_DIM); gfx.setTextSize(1);
+  gfx.setCursor(20, ND_PRESETS_Y - 12);
+  gfx.print("PRESETS:");
+  const int pw = 170, ph = 50, pgap = 15;
+  _btn(20,                       ND_PRESETS_Y, pw, ph, C_GRAY, "Every day", 2);
+  _btn(20 + (pw + pgap) * 1,     ND_PRESETS_Y, pw, ph, C_GRAY, "Weekdays",  2);
+  _btn(20 + (pw + pgap) * 2,     ND_PRESETS_Y, pw, ph, C_GRAY, "Weekends",  2);
+  _btn(20 + (pw + pgap) * 3,     ND_PRESETS_Y, pw, ph, C_GRAY, "Clear all", 2);
+
+  // Selected summary at bottom
+  gfx.fillRect(0, STS_Y, SCR_W, STS_H, C_BLACK);
+  char summary[48];
+  _formatDaysMask(_newDaysMask, summary, sizeof(summary));
+  gfx.setTextColor(C_DIM); gfx.setTextSize(1);
+  gfx.setCursor(10, STS_Y + 14);
+  gfx.print("Runs: "); gfx.print(summary);
+
+  // Nav: BACK | SAVE
+  gfx.fillRect(0, NAV_Y, SCR_W, NAV_H, C_BG);
+  _btn(20,          NAV_Y + 10, 160, 50, C_GRAY,  "< BACK", 2);
+  _btn(SCR_W - 200, NAV_Y + 10, 180, 50, C_GREEN, "SAVE",   2, C_BLACK);
+}
+
+void _handleNewDaysTouch(int tx, int ty) {
+  // BACK
+  if (_inRect(tx, ty, 20, NAV_Y + 10, 160, 50)) {
+    currentScreen = SCR_NEW_SCHEDULE;
+    needsRedraw = true; return;
+  }
+  // SAVE — assemble theSchedule from the collected builder state
+  if (_inRect(tx, ty, SCR_W - 200, NAV_Y + 10, 180, 50)) {
+    int n = 0;
+    for (int i = 0; i < ZONE_COUNT; i++) {
+      if (_newZones[i]) {
+        theSchedule.steps[n].zoneId   = i + 1;
+        theSchedule.steps[n].duration = _newDuration * 60;
+        n++;
+      }
+    }
+    if (n == 0) {
+      // shouldn't happen — NEXT button is gated on n > 0, but be defensive
+      currentScreen = SCR_NEW_SCHEDULE; needsRedraw = true; return;
+    }
+    if (runState.running) stopSchedule();
+    theSchedule.used      = true;
+    theSchedule.id        = nextScheduleId++;
+    strncpy(theSchedule.name, "On-device", sizeof(theSchedule.name) - 1);
+    theSchedule.name[sizeof(theSchedule.name) - 1] = '\0';
+    theSchedule.stepCount = n;
+    theSchedule.runHour   = _newHour;
+    theSchedule.runMinute = _newMin;
+    theSchedule.daysMask  = _newDaysMask;
+    theSchedule.autoRun   = (_newDaysMask != 0);
+    currentScreen = SCR_SCHEDULES;
+    needsRedraw = true;
+    return;
+  }
+
+  // Preset buttons
+  const int pw = 170, ph = 50, pgap = 15;
+  for (int i = 0; i < 4; i++) {
+    int x = 20 + (pw + pgap) * i;
+    if (_inRect(tx, ty, x, ND_PRESETS_Y, pw, ph)) {
+      switch (i) {
+        case 0: _newDaysMask = 0x7F; break;   // Every day
+        case 1: _newDaysMask = 0x3E; break;   // Weekdays (Mon-Fri)
+        case 2: _newDaysMask = 0x41; break;   // Weekends (Sun+Sat)
+        case 3: _newDaysMask = 0x00; break;   // Clear
+      }
+      needsRedraw = true;
+      return;
+    }
+  }
+
+  // Individual day toggles
+  int day = _hitDay(tx, ty, ND_DAYS_Y);
+  if (day >= 0) {
+    _newDaysMask ^= (uint8_t)(1 << day);
+    needsRedraw = true;
+    return;
+  }
+}
+
 // ── Public API ─────────────────────────────────────────────────────────────
 
 void displayInit() {
@@ -661,6 +1068,8 @@ void displayLoop() {
       case SCR_SCHEDULES:        _drawSchedulesScreen();             break;
       case SCR_EDIT:             _drawEditScreen();                  break;
       case SCR_ZONE_SETTINGS:    _drawZoneSettingsScreen();          break;
+      case SCR_NEW_SCHEDULE:     _drawNewScheduleScreen();           break;
+      case SCR_NEW_DAYS:         _drawNewDaysScreen();               break;
       case SCR_PAIRING:          _drawPairingScreen();               break;
       case SCR_WIFI_LIST:        wifi_setup::drawListScreen();       break;
       case SCR_WIFI_PASSWORD:    wifi_setup::drawPasswordScreen();   break;
@@ -718,6 +1127,8 @@ void displayLoop() {
         case SCR_SCHEDULES:        _handleSchedulesTouch(tx, ty);            break;
         case SCR_EDIT:             _handleEditTouch(tx, ty);                 break;
         case SCR_ZONE_SETTINGS:    _handleZoneSettingsTouch(tx, ty);         break;
+        case SCR_NEW_SCHEDULE:     _handleNewScheduleTouch(tx, ty);          break;
+        case SCR_NEW_DAYS:         _handleNewDaysTouch(tx, ty);              break;
         case SCR_PAIRING:          _handlePairingTouch(tx, ty);              break;
         case SCR_WIFI_LIST:        wifi_setup::handleListTouch(tx, ty);      break;
         case SCR_WIFI_PASSWORD:    wifi_setup::handlePasswordTouch(tx, ty);  break;

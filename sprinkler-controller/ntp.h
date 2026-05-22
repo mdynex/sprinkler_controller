@@ -100,6 +100,10 @@ int ntpHour()   { return (int)((_nowEpoch() % 86400UL) / 3600UL); }
 int ntpMinute() { return (int)((_nowEpoch() % 3600UL)  / 60UL); }
 int ntpSecond() { return (int)(_nowEpoch() % 60UL); }
 
+// Current local day of week (0 = Sunday, 6 = Saturday).
+// Jan 1 1970 was a Thursday → day index 4.
+int ntpDayOfWeek() { return (int)(((_nowEpoch() / 86400UL) + 4UL) % 7UL); }
+
 // Current local time as a Unix epoch timestamp.
 unsigned long ntpEpoch() { return _nowEpoch(); }
 

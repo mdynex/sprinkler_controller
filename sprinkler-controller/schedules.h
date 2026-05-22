@@ -35,15 +35,22 @@ struct ZoneStep {
 };
 
 // The single schedule stored in memory.
+//
+// `daysMask` is a bitmask of weekdays the schedule should auto-run on:
+//   bit 0 = Sunday, bit 1 = Monday, ..., bit 6 = Saturday
+// A daysMask of 0 means manual-only (no auto-run). `autoRun` is kept around
+// so the JSON back-and-forth with the app stays compatible — it's just a
+// derived view (autoRun == (daysMask != 0)).
 struct Schedule {
-  bool     used;                         // false = no schedule loaded
-  int      id;                           // ID assigned at creation, increments on replace
-  char     name[32];                     // human-readable name
-  ZoneStep steps[SCHEDULE_MAX_STEPS];    // ordered list of zone steps
-  int      stepCount;                    // number of active steps
-  bool     autoRun;                      // true = fire automatically every day
-  int      runHour;                      // 0–23, local time
-  int      runMinute;                    // 0–59, local time
+  bool     used;
+  int      id;
+  char     name[32];
+  ZoneStep steps[SCHEDULE_MAX_STEPS];
+  int      stepCount;
+  bool     autoRun;                      // legacy mirror of (daysMask != 0)
+  uint8_t  daysMask;                     // bit 0=Sun, 1=Mon, ..., 6=Sat
+  int      runHour;
+  int      runMinute;
 };
 
 // ── Global state ───────────────────────────────────────────────────────────
@@ -65,6 +72,7 @@ RunState runState = {false, 0, 0};
 void schedulesInit() {
   theSchedule.used      = false;
   theSchedule.autoRun   = false;
+  theSchedule.daysMask  = 0;     // no auto-run by default
   theSchedule.runHour   = 6;
   theSchedule.runMinute = 0;
   lastRunEpoch          = 0;
@@ -81,7 +89,16 @@ String scheduleToJson(const Schedule& s) {
                 ",\"name\":\""     + s.name + "\"" +
                 ",\"auto_run\":"   + (s.autoRun ? "true" : "false") +
                 ",\"run_time\":\"" + timeBuf + "\"" +
-                ",\"zones\":[";
+                ",\"days\":[";
+  bool first = true;
+  for (int d = 0; d < 7; d++) {
+    if ((s.daysMask >> d) & 1) {
+      if (!first) json += ",";
+      json += String(d);
+      first = false;
+    }
+  }
+  json += "],\"zones\":[";
   for (int i = 0; i < s.stepCount; i++) {
     if (i > 0) json += ",";
     json += "{\"zone\":"     + String(s.steps[i].zoneId) +
@@ -123,7 +140,20 @@ bool parseScheduleBody(const String& body, Schedule& s) {
   if (doc["name"].is<const char*>())
     strncpy(s.name, doc["name"].as<const char*>(), sizeof(s.name) - 1);
 
-  s.autoRun = doc["auto_run"].is<bool>() ? doc["auto_run"].as<bool>() : false;
+  // Days: explicit array wins. Otherwise fall back to auto_run as the legacy
+  // "all 7 days" shortcut so the app's existing send-schedule flow keeps
+  // working without changes.
+  s.daysMask = 0;
+  if (doc["days"].is<JsonArray>()) {
+    JsonArray daysArr = doc["days"].as<JsonArray>();
+    for (JsonVariant v : daysArr) {
+      int d = v.as<int>();
+      if (d >= 0 && d <= 6) s.daysMask |= (uint8_t)(1 << d);
+    }
+  } else if (doc["auto_run"].is<bool>() && doc["auto_run"].as<bool>()) {
+    s.daysMask = 0x7F;
+  }
+  s.autoRun = (s.daysMask != 0);
 
   if (doc["run_time"].is<const char*>()) {
     const char* t = doc["run_time"].as<const char*>();
@@ -222,6 +252,9 @@ void schedulerCheck() {
   if (theSchedule.runHour   != nowHour)   return;
   if (theSchedule.runMinute != nowMinute) return;
   if (nowEpoch - lastRunEpoch < 23 * 3600UL) return;
+  // Only fire on enabled days of the week (Sun=0 ... Sat=6)
+  int dow = ntpDayOfWeek();
+  if (((theSchedule.daysMask >> dow) & 1) == 0) return;
 
   Serial.print("Auto-starting schedule: ");
   Serial.println(theSchedule.name);
