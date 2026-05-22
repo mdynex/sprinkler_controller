@@ -44,6 +44,7 @@
 #include "pairing.h"
 #include "api.h"
 #include "heartbeat.h"
+#include "wifi_recovery.h"
 
 WiFiServer server(80);
 
@@ -158,10 +159,6 @@ void setup() {
 
 // ── Loop ────────────────────────────────────────────────────────────────────
 
-// Tracks how long WiFi has been down at runtime; after 60 s we drop into the
-// on-screen setup wizard so the user can pick a new network.
-static unsigned long _wifiBadSince = 0;
-
 void loop() {
   ntpUpdate();          // re-sync time once per hour
   wifi_setup::tick();   // performs the connect attempt after CONNECTING is drawn
@@ -173,19 +170,19 @@ void loop() {
   }
   displayLoop();        // touch input + redraws
 
-  // WiFi watchdog — if we're disconnected at runtime for more than 60 s,
-  // force the on-screen setup wizard. Skipped while already in setup.
+  // WiFi watchdog — silent reconnect tier (wifi_recovery) runs first.
+  // If WiFi.status() reports disconnected, or 3 heartbeats in a row miss
+  // the server (catches the wedged-stack case where status() lies),
+  // wifi_recovery silently disconnects + WiFi.begin()s with backoff. Only
+  // when all silent attempts are exhausted do we escalate to the on-screen
+  // setup wizard, since that one needs a human to interact with it.
   if (!wifi_setup::isActive()) {
-    if (WiFi.status() != WL_CONNECTED) {
-      if (_wifiBadSince == 0) _wifiBadSince = millis();
-      else if (millis() - _wifiBadSince > 60000UL) {
-        Serial.println("[wifi] Disconnected >60s — entering setup wizard");
-        wifi_setup::run();        // blocking
-        _wifiBadSince = 0;
-        needsRedraw = true;
-      }
-    } else {
-      _wifiBadSince = 0;
+    wifi_recovery::tick();
+    if (wifi_recovery::exhausted()) {
+      Serial.println("[wifi] Silent recovery exhausted — entering setup wizard");
+      wifi_setup::run();         // blocking
+      wifi_recovery::reset();
+      needsRedraw = true;
     }
   }
 

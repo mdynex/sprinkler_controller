@@ -1,6 +1,7 @@
 #pragma once
 #include <WiFi.h>
 #include "state.h"
+#include "wifi_recovery.h"
 
 // =============================================================================
 // heartbeat.h — Periodic keepalive to the Home AI Server
@@ -55,6 +56,11 @@ void heartbeatTick() {
   WiFiClient client;
   if (!client.connect(host, port)) {
     Serial.println("[heartbeat] Cannot reach server");
+    // Signal wifi_recovery so a wedged-but-status-OK radio still triggers
+    // a silent reconnect after a few consecutive misses. Server-down (vs.
+    // wifi-down) is indistinguishable here, but the worst case is a
+    // harmless redundant reconnect once the threshold is hit.
+    wifi_recovery::noteHeartbeatFailure();
     return;
   }
 
@@ -73,5 +79,16 @@ void heartbeatTick() {
   // Wait briefly for the response, then discard it
   unsigned long start = millis();
   while (!client.available() && millis() - start < 3000) delay(10);
+  bool gotResponse = client.available();
   client.stop();
+
+  if (gotResponse) {
+    wifi_recovery::noteHeartbeatSuccess();
+  } else {
+    // Connect succeeded but no bytes came back within 3 s — server is up
+    // enough to ACK SYN but not enough to respond. Treat as a soft failure
+    // so the recovery tier still escalates after repeated misses.
+    Serial.println("[heartbeat] No response from server");
+    wifi_recovery::noteHeartbeatFailure();
+  }
 }
