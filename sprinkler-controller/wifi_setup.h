@@ -1,6 +1,7 @@
 #pragma once
 #include <WiFi.h>
 #include "config.h"
+#include "watchdog.h"
 #include "state.h"
 #include "storage.h"
 #include "display.h"
@@ -436,8 +437,11 @@ void run() {
   _doScan();
   currentScreen  = SCR_WIFI_LIST;
   needsRedraw    = true;
-  // Loop until we leave the wifi-setup screens (set by tick() on success)
+  // Loop until we leave the wifi-setup screens (set by tick() on success).
+  // This blocks for a human, so it must keep feeding the watchdog itself —
+  // otherwise an unattended-but-mid-setup board would reset every 30s.
   while (isActive()) {
+    wdt::kick();
     displayLoop();
     tick();
   }

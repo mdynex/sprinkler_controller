@@ -1,5 +1,6 @@
 #pragma once
 #include <WiFi.h>
+#include "mbed.h"          // mbed_stats_heap_get — heap diagnostic
 #include "state.h"
 #include "wifi_recovery.h"
 
@@ -39,6 +40,46 @@ static void _parseHostPort(const char* hostPort, char* hostOut, size_t hostLen, 
   hostOut[hlen] = '\0';
   *portOut = atoi(colon + 1);
   if (*portOut <= 0) *portOut = 8000;
+}
+
+// Largest single block malloc will still hand out, found by binary search.
+// This is the direct fragmentation signal and — unlike mbed_stats_heap_get —
+// it works no matter how the core was built: if free memory has fragmented
+// into small islands, this number shrinks even while total free bytes look
+// healthy. The block is freed immediately, so the probe is non-destructive.
+static size_t _largestFreeBlock() {
+  size_t lo = 0, hi = 512UL * 1024UL;   // search 0..512 KB
+  while (lo < hi) {
+    size_t mid = (lo + hi + 1) / 2;
+    void* p = malloc(mid);
+    if (p) { free(p); lo = mid; }
+    else   { hi = mid - 1; }
+  }
+  return lo;
+}
+
+// Periodic heap log — diagnostic for the Arduino-String fragmentation theory.
+// Runs once per minute regardless of pairing state, so it captures the heap
+// trend even before the device is provisioned. Watch the serial log over a few
+// hours of uptime:
+//   • largestBlock shrinking over time     → fragmentation and/or a leak; this
+//                                             is the freeze mechanism
+//   • mbed `current` climbing steadily      → a straight leak
+//   • mbed values all 0                     → heap stats aren't compiled into
+//                                             your core; rely on largestBlock
+// Safe to delete once the cause is settled.
+void heapLogTick() {
+  static unsigned long _lastHeapLog = 0;
+  unsigned long now = millis();
+  if (now - _lastHeapLog < HB_INTERVAL_MS) return;
+  _lastHeapLog = now;
+
+  mbed_stats_heap_t hs;
+  mbed_stats_heap_get(&hs);
+  Serial.print("[heap] largestBlock="); Serial.print(_largestFreeBlock());
+  Serial.print(" current=");            Serial.print(hs.current_size);
+  Serial.print(" reserved=");           Serial.print(hs.reserved_size);
+  Serial.print(" allocFails=");         Serial.println(hs.alloc_fail_cnt);
 }
 
 void heartbeatTick() {

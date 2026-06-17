@@ -30,10 +30,12 @@ HttpRequest readRequest(WiFiClient& client) {
 
   String line = "";
   bool firstLine = true;
-  unsigned long deadline = millis() + 2000;
+  // Use elapsed-time comparison (millis() - start), not an absolute deadline,
+  // so the loop still terminates correctly across the millis() rollover.
+  unsigned long start = millis();
 
-  while (client.connected() && millis() < deadline) {
-    if (!client.available()) continue;
+  while (client.connected() && millis() - start < 2000) {
+    if (!client.available()) { delay(1); continue; }  // yield to the mbed net thread
     char c = client.read();
 
     if (c == '\n') {
@@ -68,9 +70,11 @@ HttpRequest readRequest(WiFiClient& client) {
 
   // Read the request body if Content-Length was set (POST/PUT with JSON)
   if (req.contentLength > 0) {
-    deadline = millis() + 1500;
-    while ((int)req.body.length() < req.contentLength && millis() < deadline) {
+    req.body.reserve(req.contentLength);   // one allocation instead of growing byte-by-byte
+    unsigned long bodyStart = millis();
+    while ((int)req.body.length() < req.contentLength && millis() - bodyStart < 1500) {
       if (client.available()) req.body += (char)client.read();
+      else                    delay(1);   // yield instead of busy-spinning
     }
   }
 

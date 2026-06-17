@@ -32,6 +32,7 @@
 #include <Arduino_GigaDisplay_GFX.h>
 #include <Arduino_GigaDisplayTouch.h>
 #include "config.h"
+#include "watchdog.h"
 #include "state.h"
 #include "storage.h"
 #include "http_utils.h"
@@ -155,11 +156,20 @@ void setup() {
   server.begin();
   Serial.print("API ready at http://");
   Serial.println(WiFi.localIP());
+
+  // 4. Arm the hardware watchdog. Done last, after all the long boot-time
+  //    blocking (WiFi connect, on-screen setup, NTP) so those don't trip it.
+  //    From here on, loop() must kick it within wdt::WATCHDOG_TIMEOUT_MS or
+  //    the board resets.
+  wdt::begin();
 }
 
 // ── Loop ────────────────────────────────────────────────────────────────────
 
 void loop() {
+  wdt::kick();          // feed the hardware watchdog — must happen every pass
+  heapLogTick();        // diagnostic: log free heap once a minute (see heartbeat.h)
+
   ntpUpdate();          // re-sync time once per hour
   wifi_setup::tick();   // performs the connect attempt after CONNECTING is drawn
 
