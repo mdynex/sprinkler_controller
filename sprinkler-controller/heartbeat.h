@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include "mbed.h"          // mbed_stats_heap_get — heap diagnostic
 #include "state.h"
+#include "missed.h"
 #include "wifi_recovery.h"
 
 // =============================================================================
@@ -105,23 +106,65 @@ void heartbeatTick() {
     return;
   }
 
-  String ip   = WiFi.localIP().toString();
-  String body = String("{\"address\":\"") + ip + ":80\"}";
+  String ip = WiFi.localIP().toString();
+
+  // Body carries the LAN address, plus any jobs the device slept through since
+  // the last successful report. Built in a static buffer — this runs every
+  // minute forever, so it must not churn the heap.
+  static char body[1024];
+  int n = snprintf(body, sizeof(body), "{\"address\":\"%s:80\"", ip.c_str());
+  int reported = missed::count();
+  if (reported > 0 && (size_t)n < sizeof(body)) {
+    int w = snprintf(body + n, sizeof(body) - n, ",\"missed_jobs\":");
+    n += w;
+    int m = missed::toJson(body + n, sizeof(body) - n);
+    if (m > 0) {
+      n += m;
+    } else {
+      n -= w;          // didn't fit — send the plain heartbeat, retry next time
+      reported = 0;
+    }
+  }
+  if ((size_t)n < sizeof(body) - 2) {
+    n += snprintf(body + n, sizeof(body) - n, "}");
+  }
 
   client.println("POST /devices/heartbeat HTTP/1.1");
   client.print("Host: ");           client.println(host);
   client.print("X-Device-Token: "); client.println(deviceToken);
   client.println("Content-Type: application/json");
-  client.print("Content-Length: "); client.println(body.length());
+  client.print("Content-Length: "); client.println(n);
   client.println("Connection: close");
   client.println();
-  client.print(body);
+  client.write((const uint8_t*)body, n);
 
-  // Wait briefly for the response, then discard it
+  // Read the status line so we only clear the missed-job buffer once the
+  // server has actually accepted the report. Dropping it on a 5xx would lose
+  // the only notification the user gets that watering was skipped.
   unsigned long start = millis();
   while (!client.available() && millis() - start < 3000) delay(10);
   bool gotResponse = client.available();
+
+  bool accepted = false;
+  if (gotResponse) {
+    char status[64] = {0};
+    size_t i = 0;
+    while (client.available() && i < sizeof(status) - 1) {
+      char c = client.read();
+      if (c == '\n') break;
+      status[i++] = c;
+    }
+    // "HTTP/1.1 200 OK" — accept any 2xx.
+    const char* sp = strchr(status, ' ');
+    if (sp && sp[1] == '2') accepted = true;
+  }
   client.stop();
+
+  if (accepted && reported > 0) {
+    Serial.print("[heartbeat] Reported "); Serial.print(reported);
+    Serial.println(" missed job(s)");
+    missed::clear();
+  }
 
   if (gotResponse) {
     wifi_recovery::noteHeartbeatSuccess();

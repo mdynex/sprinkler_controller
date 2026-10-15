@@ -1,7 +1,9 @@
 #pragma once
 #include "http_utils.h"
 #include "zones.h"
-#include "schedules.h"
+#include "jobs.h"
+#include "storage.h"
+#include "missed.h"
 #include "ntp.h"
 #include "state.h"
 
@@ -12,40 +14,108 @@ void routeProvision(WiFiClient& client, HttpRequest& req);  // defined in pairin
 // =============================================================================
 // api.h — REST API route handlers
 //
-// All incoming HTTP requests are dispatched here by handleApi(). Each route
-// is matched by HTTP method + URL path. Responses are always JSON.
-//
-// Full API reference:
+// All incoming HTTP requests are dispatched here by handleApi(). Each route is
+// matched by HTTP method + URL path. Responses are always JSON.
 //
 //   GET  /time                   → current synced time and epoch
 //   GET  /zones                  → list all zones and their on/off state
-//   POST /zones/{id}/on          → turn zone {id} on  (id = 1–8)
-//   POST /zones/{id}/off         → turn zone {id} off
+//   POST /zones/{id}/on|off      → turn zone {id} on/off  (id = 1–8)
+//   PUT  /zones/{id}             → update zone settings (enabled, rate)
 //
-//   GET  /schedules              → list all schedules
-//   POST /schedules              → create a new schedule (JSON body required)
-//   GET  /schedules/{id}         → get one schedule by id
-//   PUT  /schedules/{id}         → update a schedule (JSON body required)
-//   DELETE /schedules/{id}       → delete a schedule
-//   POST /schedules/{id}/run     → start running a schedule immediately
-//   POST /schedules/stop         → stop whichever schedule is running
-//   GET  /schedules/run          → get current run status
+//   GET    /jobs                 → list every job
+//   POST   /jobs                 → ADD a job (does not replace existing ones)
+//   GET    /jobs/{id}            → one job
+//   PUT    /jobs/{id}            → partial update; this is how a run command
+//                                  is promoted to a schedule (set "repeat")
+//   DELETE /jobs/{id}            → remove a job
+//   POST   /jobs/{id}/run        → run a job immediately
+//   POST   /jobs/stop            → stop whatever is running
+//   GET    /jobs/run             → current run status
+//   GET    /jobs/missed          → jobs missed while the device was off
 //
-// Schedule JSON body format (for POST and PUT):
+//   POST /command                → generic device command (rules engine)
+//
+// The older /schedules* paths are kept as aliases onto the same handlers so
+// the Android app keeps working untouched.
+//
+// Job JSON body (POST and PUT):
 //   {
-//     "name":     "Morning",       required
-//     "auto_run": true,            optional, default false
-//     "run_time": "06:00",         optional, 24h HH:MM, default "06:00"
-//     "zones": [                   required, at least one entry
-//       { "zone": 1, "duration": 300 },   zone 1-8, duration in seconds
-//       { "zone": 3, "duration": 600 }
+//     "name":        "Morning",      required on create
+//     "repeat":      "none",         "none" | "daily" | "weekly"
+//     "days":        [1,3,5],        0=Sun..6=Sat, implies weekly
+//     "run_time":    "06:00",        recurring fire time, 24h HH:MM
+//     "run_at":      1723800000,     one-shot absolute epoch
+//     "on_complete": "delete",       "keep" | "delete" | "disable"
+//     "enabled":     true,
+//     "zones": [                     required on create
+//       { "zone": 1, "duration": 300 },   zone 1-8, seconds
+//       { "zone": 0, "duration": 600 }    zone 0 = idle/soak pause
 //     ]
 //   }
 // =============================================================================
 
+// Scratch buffer for serializing one job. Static so a large response never
+// touches the heap — this board has a known fragmentation sensitivity.
+static char _jobBuf[2048];
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+static void _sendJob(WiFiClient& client, int status, const Job& j) {
+  int n = jobToJson(j, _jobBuf, sizeof(_jobBuf));
+  if (n <= 0) { sendResponse(client, 500, "{\"error\":\"job too large to encode\"}"); return; }
+  sendResponseRaw(client, status, _jobBuf, n);
+}
+
+static void _persistAndRefresh() {
+  storage::saveAllJobs();
+  needsRedraw = true;
+}
+
+// Extract the numeric id from a path like "/jobs/12" or "/jobs/12/run".
+static int _idFromPath(const String& path, int prefixLen) {
+  return path.substring(prefixLen).toInt();
+}
+
+// Both /jobs and /schedules map onto the same handlers; this reports how many
+// characters to skip to reach the id.
+static int _prefixLen(const String& p) {
+  return p.startsWith("/jobs/") ? 6 : 11;   // "/jobs/" vs "/schedules/"
+}
+
+// ── Job list (streamed) ────────────────────────────────────────────────────
+
+// Serialize the whole job array without ever holding it in one allocation.
+// Pass 1 measures, pass 2 writes — so the response still carries an exact
+// Content-Length for clients that need one.
+static void _sendJobList(WiFiClient& client) {
+  int total = 2;   // "[" and "]"
+  int used  = 0;
+  for (int i = 0; i < MAX_JOBS; i++) {
+    if (!jobs[i].used) continue;
+    int n = jobToJson(jobs[i], _jobBuf, sizeof(_jobBuf));
+    if (n <= 0) continue;
+    if (used > 0) total += 1;   // comma
+    total += n;
+    used++;
+  }
+
+  sendHeaders(client, 200, total);
+  client.print("[");
+  bool first = true;
+  for (int i = 0; i < MAX_JOBS; i++) {
+    if (!jobs[i].used) continue;
+    int n = jobToJson(jobs[i], _jobBuf, sizeof(_jobBuf));
+    if (n <= 0) continue;
+    if (!first) client.print(",");
+    client.write((const uint8_t*)_jobBuf, n);
+    first = false;
+  }
+  client.print("]");
+}
+
+// ── Zones ──────────────────────────────────────────────────────────────────
+
 // Handle POST /zones/{id}/on|off
-// Parses the zone id and action from the path, validates them, and toggles
-// the relay pin via setZone().
 void routeZoneControl(WiFiClient& client, HttpRequest& req) {
   String rest  = req.path.substring(7);  // strip leading "/zones/"
   int    slash = rest.indexOf('/');
@@ -67,22 +137,104 @@ void routeZoneControl(WiFiClient& client, HttpRequest& req) {
     "{\"id\":" + String(id + 1) + ",\"state\":\"" + action + "\"}");
 }
 
-// Handle POST /schedules/{id}/run
-// Extracts the schedule id from between "/schedules/" and "/run".
-// Since there is only one schedule, the id is accepted as long as it matches.
-void routeRunSchedule(WiFiClient& client, const String& path) {
-  int id = path.substring(11, path.length() - 4).toInt();
-  if (!theSchedule.used || theSchedule.id != id) {
-    sendResponse(client, 404, "{\"error\":\"schedule not found\"}"); return;
+// ── Generic command ────────────────────────────────────────────────────────
+
+// POST /command — the device-agnostic entry point the server's rules engine
+// and time-based actions post to (see _send_command in routes/rules/engine.py).
+//
+// Rather than duplicating the runner, a command with a duration becomes a
+// one-shot job that deletes itself: exactly the same machinery a "water once
+// tomorrow" push from the server uses.
+void routeCommand(WiFiClient& client, HttpRequest& req) {
+  JsonDocument doc;
+  if (deserializeJson(doc, req.body) != DeserializationError::Ok) {
+    sendResponse(client, 400, "{\"error\":\"invalid JSON body\"}"); return;
   }
-  startSchedule();
-  needsRedraw = true;
-  wakeDisplay();
-  sendResponse(client, 200,
-    "{\"started\":true,\"schedule_id\":" + String(theSchedule.id) + "}");
+
+  const char* action = doc["action"].is<const char*>() ? doc["action"].as<const char*>() : "";
+
+  if (strcmp(action, "stop") == 0) {
+    stopJob();
+    needsRedraw = true;
+    wakeDisplay();
+    sendResponse(client, 200, "{\"ok\":true,\"action\":\"stop\"}");
+    return;
+  }
+
+  if (strcmp(action, "run_job") == 0) {
+    int jobId = doc["job_id"].as<int>();
+    Job* j = findJob(jobId);
+    if (!j) { sendResponse(client, 404, "{\"error\":\"job not found\"}"); return; }
+    if (!startJob(*j)) {
+      sendResponse(client, 409, "{\"error\":\"job has no runnable zones\"}"); return;
+    }
+    needsRedraw = true;
+    wakeDisplay();
+    sendResponse(client, 200, "{\"ok\":true,\"action\":\"run_job\"}");
+    return;
+  }
+
+  if (strcmp(action, "zone_on") == 0 || strcmp(action, "zone_off") == 0) {
+    int zoneId = doc["zone_id"].as<int>();
+    if (zoneId < 1 || zoneId > ZONE_COUNT) {
+      sendResponse(client, 400, "{\"error\":\"zone_id out of range\"}"); return;
+    }
+
+    if (strcmp(action, "zone_off") == 0) {
+      setZone(zoneId - 1, false);
+      needsRedraw = true;
+      wakeDisplay();
+      sendResponse(client, 200, "{\"ok\":true,\"action\":\"zone_off\"}");
+      return;
+    }
+
+    int duration = doc["duration"].as<int>();
+    if (duration <= 0) {
+      // No duration — a plain latch. Stays on until something turns it off.
+      setZone(zoneId - 1, true);
+      needsRedraw = true;
+      wakeDisplay();
+      sendResponse(client, 200, "{\"ok\":true,\"action\":\"zone_on\"}");
+      return;
+    }
+
+    // Timed run — becomes a self-deleting one-shot so the runner closes the
+    // valve for us even if the server never calls back. Marked transient: a
+    // rule firing on an interval must not burn a flash write every time.
+    Job* j = allocJob();
+    if (!j) { sendResponse(client, 507, "{\"error\":\"job storage full\"}"); return; }
+    jobInitDefaults(*j);
+    j->used        = true;
+    j->id          = nextJobId++;
+    j->enabled     = true;
+    j->repeat      = REPEAT_NONE;
+    j->onComplete  = ON_COMPLETE_DELETE;
+    j->isTransient = true;
+    j->stepCount   = 1;
+    j->steps[0]    = { zoneId, duration };
+    j->runAtEpoch  = ntpReady ? (uint32_t)ntpEpoch() : 0;
+    snprintf(j->name, sizeof(j->name), "Zone %d (%ds)", zoneId, duration);
+    strncpy(j->origin, "server", sizeof(j->origin) - 1);
+
+    if (!startJob(*j)) {
+      jobInitDefaults(*j);
+      sendResponse(client, 409, "{\"error\":\"zone is disabled\"}"); return;
+    }
+    needsRedraw = true;
+    wakeDisplay();
+    _sendJob(client, 200, *j);
+    return;
+  }
+
+  // Unknown action — echo it back so a misconfigured rule is diagnosable from
+  // the server log instead of failing as a bare 404.
+  snprintf(_jobBuf, sizeof(_jobBuf),
+           "{\"error\":\"unknown action\",\"action\":\"%.64s\"}", action);
+  sendResponse(client, 400, String(_jobBuf));
 }
 
-// Main request dispatcher — called for every incoming HTTP request.
+// ── Dispatcher ─────────────────────────────────────────────────────────────
+
 void handleApi(WiFiClient& client, HttpRequest& req) {
   String& m = req.method;
   String& p = req.path;
@@ -100,35 +252,42 @@ void handleApi(WiFiClient& client, HttpRequest& req) {
     return;
   }
 
-  // GET /time — returns current synced time
+  // Treat /schedules* as an alias for /jobs* throughout.
+  bool isJobPath = p.startsWith("/jobs") || p.startsWith("/schedules");
+  String tail;   // the part after the collection name, e.g. "", "/run", "/12"
+  if (isJobPath) {
+    tail = p.startsWith("/jobs") ? p.substring(5) : p.substring(10);
+  }
+
+  // GET /time
   if (m == "GET" && p == "/time") {
     sendResponse(client, 200, currentTimeJson());
 
-  // GET /zones — list all zones
+  // GET /zones
   } else if (m == "GET" && p == "/zones") {
     sendResponse(client, 200, zonesJson());
 
-  // POST /zones/{id}/on|off — control a single zone
+  // POST /zones/{id}/on|off
   } else if (m == "POST" && p.startsWith("/zones/")) {
     routeZoneControl(client, req);
 
-  // PUT /zones/{id} — update zone settings (rate only for now)
+  // PUT /zones/{id} — update zone settings
   } else if (m == "PUT" && p.startsWith("/zones/")) {
-    int id  = p.substring(7).toInt() - 1;
+    int id = p.substring(7).toInt() - 1;
     if (id < 0 || id >= ZONE_COUNT) {
       sendResponse(client, 404, "{\"error\":\"zone not found\"}"); return;
     }
-    StaticJsonDocument<64> doc;
+    JsonDocument doc;
     if (deserializeJson(doc, req.body) != DeserializationError::Ok) {
       sendResponse(client, 400, "{\"error\":\"invalid JSON body\"}"); return;
     }
-    if (doc.containsKey("enabled")) {
+    if (!doc["enabled"].isNull()) {
       zoneEnabled[id] = doc["enabled"].as<bool>();
       if (!zoneEnabled[id]) setZone(id, false);  // turn off immediately if disabled
       needsRedraw = true;
       wakeDisplay();
     }
-    if (doc.containsKey("rate")) {
+    if (!doc["rate"].isNull()) {
       int tenths = (int)round(doc["rate"].as<float>() * 10.0f);
       if (tenths < 1 || tenths > 50) {
         sendResponse(client, 400, "{\"error\":\"rate must be 0.1–5.0 in/hr\"}"); return;
@@ -142,68 +301,91 @@ void handleApi(WiFiClient& client, HttpRequest& req) {
       ",\"enabled\":" + (zoneEnabled[id] ? "true" : "false") +
       ",\"rate\":"    + rateBuf + "}");
 
-  // GET /schedules — return the one schedule (or an empty array)
-  } else if (m == "GET" && p == "/schedules") {
-    sendResponse(client, 200, schedulesListJson());
+  // POST /command — generic device command
+  } else if (m == "POST" && p == "/command") {
+    routeCommand(client, req);
 
-  // GET /schedules/run — current run status (checked before /schedules/{id}
-  // so "run" is not mistaken for a numeric id)
-  } else if (m == "GET" && p == "/schedules/run") {
-    sendResponse(client, 200, runStateJson());
+  // GET /jobs/run — run status. Checked before /jobs/{id} so "run" is not
+  // mistaken for an id.
+  } else if (m == "GET" && isJobPath && tail == "/run") {
+    int n = runStateJson(_jobBuf, sizeof(_jobBuf));
+    sendResponseRaw(client, 200, _jobBuf, n);
 
-  // GET /schedules/{id} — get the schedule (id must match)
-  } else if (m == "GET" && p.startsWith("/schedules/")) {
-    int id = p.substring(11).toInt();
-    if (!theSchedule.used || theSchedule.id != id) {
-      sendResponse(client, 404, "{\"error\":\"schedule not found\"}"); return;
-    }
-    sendResponse(client, 200, scheduleToJson(theSchedule));
+  // GET /jobs/missed — what the device slept through
+  } else if (m == "GET" && isJobPath && tail == "/missed") {
+    int n = missed::toJson(_jobBuf, sizeof(_jobBuf));
+    sendResponseRaw(client, 200, _jobBuf, n);
 
-  // POST /schedules — replace the current schedule (stops any running schedule)
-  } else if (m == "POST" && p == "/schedules") {
-    Schedule s = {};
-    if (!parseScheduleBody(req.body, s)) {
-      sendResponse(client, 400, "{\"error\":\"invalid body\"}"); return;
-    }
-    if (runState.running) stopSchedule();
-    s.used = true;
-    s.id   = nextScheduleId++;
-    theSchedule = s;
-    sendResponse(client, 201, scheduleToJson(theSchedule));
-
-  // PUT /schedules/{id} — update the schedule in-place (id must match)
-  } else if (m == "PUT" && p.startsWith("/schedules/")) {
-    int id = p.substring(11).toInt();
-    if (!theSchedule.used || theSchedule.id != id) {
-      sendResponse(client, 404, "{\"error\":\"schedule not found\"}"); return;
-    }
-    Schedule s = theSchedule;  // start from existing values so partial updates work
-    if (!parseScheduleBody(req.body, s)) {
-      sendResponse(client, 400, "{\"error\":\"invalid body\"}"); return;
-    }
-    theSchedule = s;
-    sendResponse(client, 200, scheduleToJson(theSchedule));
-
-  // DELETE /schedules/{id} — remove the schedule (id must match)
-  } else if (m == "DELETE" && p.startsWith("/schedules/")) {
-    int id = p.substring(11).toInt();
-    if (!theSchedule.used || theSchedule.id != id) {
-      sendResponse(client, 404, "{\"error\":\"schedule not found\"}"); return;
-    }
-    if (runState.running) stopSchedule();
-    theSchedule.used = false;
-    sendResponse(client, 200, "{\"deleted\":true}");
-
-  // POST /schedules/{id}/run — start the schedule immediately (id must match)
-  } else if (m == "POST" && p.startsWith("/schedules/") && p.endsWith("/run")) {
-    routeRunSchedule(client, p);
-
-  // POST /schedules/stop — stop whatever is currently running
-  } else if (m == "POST" && p == "/schedules/stop") {
-    stopSchedule();
+  // POST /jobs/stop — stop whatever is running
+  } else if (m == "POST" && isJobPath && tail == "/stop") {
+    stopJob();
     needsRedraw = true;
     wakeDisplay();
     sendResponse(client, 200, "{\"stopped\":true}");
+
+  // GET /jobs — list every job
+  } else if (m == "GET" && isJobPath && tail.length() == 0) {
+    _sendJobList(client);
+
+  // POST /jobs — ADD a job. Unlike the old single-schedule firmware this does
+  // not replace anything.
+  } else if (m == "POST" && isJobPath && tail.length() == 0) {
+    Job staged;
+    jobInitDefaults(staged);
+    if (!parseJobBody(req.body, staged, /*requireSteps=*/true)) {
+      sendResponse(client, 400, "{\"error\":\"invalid body\"}"); return;
+    }
+    Job* slot = allocJob();
+    if (!slot) {
+      sendResponse(client, 507, "{\"error\":\"job storage full\"}"); return;
+    }
+    staged.used = true;
+    staged.id   = nextJobId++;
+    *slot = staged;
+    _persistAndRefresh();
+    _sendJob(client, 201, *slot);
+
+  // POST /jobs/{id}/run — run immediately
+  } else if (m == "POST" && isJobPath && tail.endsWith("/run")) {
+    int id = _idFromPath(p, _prefixLen(p));
+    Job* j = findJob(id);
+    if (!j) { sendResponse(client, 404, "{\"error\":\"job not found\"}"); return; }
+    if (!startJob(*j)) {
+      sendResponse(client, 409, "{\"error\":\"job has no runnable zones\"}"); return;
+    }
+    needsRedraw = true;
+    wakeDisplay();
+    sendResponse(client, 200,
+      "{\"started\":true,\"job_id\":" + String(j->id) +
+      ",\"schedule_id\":" + String(j->id) + "}");
+
+  // GET /jobs/{id}
+  } else if (m == "GET" && isJobPath && tail.length() > 1) {
+    Job* j = findJob(_idFromPath(p, _prefixLen(p)));
+    if (!j) { sendResponse(client, 404, "{\"error\":\"job not found\"}"); return; }
+    _sendJob(client, 200, *j);
+
+  // PUT /jobs/{id} — partial update. Setting "repeat" here is what turns a
+  // run command into a schedule.
+  } else if (m == "PUT" && isJobPath && tail.length() > 1) {
+    Job* j = findJob(_idFromPath(p, _prefixLen(p)));
+    if (!j) { sendResponse(client, 404, "{\"error\":\"job not found\"}"); return; }
+    Job staged = *j;   // start from current values so absent keys are untouched
+    if (!parseJobBody(req.body, staged, /*requireSteps=*/false)) {
+      sendResponse(client, 400, "{\"error\":\"invalid body\"}"); return;
+    }
+    *j = staged;
+    _persistAndRefresh();
+    _sendJob(client, 200, *j);
+
+  // DELETE /jobs/{id}
+  } else if (m == "DELETE" && isJobPath && tail.length() > 1) {
+    Job* j = findJob(_idFromPath(p, _prefixLen(p)));
+    if (!j) { sendResponse(client, 404, "{\"error\":\"job not found\"}"); return; }
+    if (jobIsRunning(*j)) stopJob();
+    jobInitDefaults(*j);
+    _persistAndRefresh();
+    sendResponse(client, 200, "{\"deleted\":true}");
 
   } else {
     sendResponse(client, 404, "{\"error\":\"not found\"}");

@@ -1,6 +1,7 @@
 #pragma once
 #include <kvstore_global_api.h>
 #include <string.h>
+#include "jobs.h"
 
 // =============================================================================
 // storage.h — Persistent key/value storage on the on-board flash
@@ -12,10 +13,16 @@
 //   wifi_ssid, wifi_pw         — set by the WiFi setup wizard
 //   srv_host, srv_devid,       — set by the /provision handler after a user
 //   srv_token                    claims the device through the app
+//   job_0 .. job_7             — one persisted job per slot (see below)
+//   last_alive                 — epoch of the last liveness write, used at
+//                                boot to work out what was missed while off
 //
 // The values survive power cycles. Calling clearWifiCreds() or
 // clearServerConfig() forces the device back through the relevant
 // onboarding step on next boot.
+//
+// Dependency direction: storage.h includes jobs.h, never the other way round.
+// jobs.h calls back into persistence through the onJobPersistNeeded hook.
 // =============================================================================
 
 namespace storage {
@@ -28,6 +35,7 @@ constexpr const char* K_SRV_HOST     = "srv_host";
 constexpr const char* K_SRV_DEVID    = "srv_devid";
 constexpr const char* K_SRV_TOKEN    = "srv_token";
 constexpr const char* K_PAIR_SKIPPED = "pair_skipped";   // "1" if user chose standalone mode
+constexpr const char* K_LAST_ALIVE   = "last_alive";
 
 // Read a null-terminated string. Returns false if the key is missing
 // or any read error occurs. `out` is set to "" on failure.
@@ -105,6 +113,155 @@ bool loadPairSkipped() {
 
 bool savePairSkipped() {
   return _setString(K_PAIR_SKIPPED, "1");
+}
+
+// ── Jobs ───────────────────────────────────────────────────────────────────
+//
+// One KVStore key per slot ("job_0".."job_7") so rewriting a single job
+// doesn't rewrite all of them. Each blob is a fixed header followed by
+// exactly stepCount ZoneSteps, so an 8-step job costs ~130 bytes rather than
+// the ~590 the full in-RAM struct would take.
+//
+// The magic + version prefix means a firmware upgrade that changes the layout
+// can reject old blobs cleanly instead of loading garbage into a struct that
+// drives mains-voltage relays.
+
+namespace {
+
+constexpr uint16_t JOB_BLOB_MAGIC   = 0x4A42;  // 'JB'
+constexpr uint8_t  JOB_BLOB_VERSION = 1;
+
+struct JobBlobHeader {
+  uint16_t magic;
+  uint8_t  version;
+  uint8_t  stepCount;
+  int32_t  id;
+  char     name[32];
+  char     origin[8];
+  uint8_t  enabled;
+  uint8_t  repeat;
+  uint8_t  daysMask;
+  uint8_t  onComplete;
+  int16_t  runHour;
+  int16_t  runMinute;
+  uint32_t runAtEpoch;
+  uint32_t lastRunEpoch;
+};
+
+// Largest blob a single slot can hold.
+constexpr size_t JOB_BLOB_MAX = sizeof(JobBlobHeader) + JOB_MAX_STEPS * sizeof(ZoneStep);
+
+void _jobKey(int slot, char* out, size_t outLen) {
+  snprintf(out, outLen, "job_%d", slot);
+}
+
+}  // anonymous namespace
+
+// Persist one job slot. Writing an unused slot removes the key instead.
+bool saveJob(int slot, const Job& j) {
+  if (slot < 0 || slot >= MAX_JOBS) return false;
+  char key[12];
+  _jobKey(slot, key, sizeof(key));
+
+  // Transient jobs (a timed zone run from POST /command) are deliberately not
+  // durable — clear any stale key rather than writing them.
+  if (!j.used || j.isTransient) { kv_remove(key); return true; }
+
+  uint8_t blob[JOB_BLOB_MAX];
+  JobBlobHeader h = {};
+  h.magic        = JOB_BLOB_MAGIC;
+  h.version      = JOB_BLOB_VERSION;
+  h.stepCount    = (uint8_t)j.stepCount;
+  h.id           = j.id;
+  h.enabled      = j.enabled ? 1 : 0;
+  h.repeat       = j.repeat;
+  h.daysMask     = j.daysMask;
+  h.onComplete   = j.onComplete;
+  h.runHour      = (int16_t)j.runHour;
+  h.runMinute    = (int16_t)j.runMinute;
+  h.runAtEpoch   = j.runAtEpoch;
+  h.lastRunEpoch = j.lastRunEpoch;
+  memcpy(h.name,   j.name,   sizeof(h.name));
+  memcpy(h.origin, j.origin, sizeof(h.origin));
+
+  memcpy(blob, &h, sizeof(h));
+  size_t stepBytes = (size_t)j.stepCount * sizeof(ZoneStep);
+  memcpy(blob + sizeof(h), j.steps, stepBytes);
+
+  return kv_set(key, blob, sizeof(h) + stepBytes, 0) == 0;
+}
+
+// Load one job slot into `j`. Returns false if the slot is empty or the blob
+// is unreadable / from an incompatible firmware version.
+bool loadJob(int slot, Job& j) {
+  if (slot < 0 || slot >= MAX_JOBS) return false;
+  char key[12];
+  _jobKey(slot, key, sizeof(key));
+
+  uint8_t blob[JOB_BLOB_MAX];
+  size_t actual = 0;
+  if (kv_get(key, blob, sizeof(blob), &actual) != 0) return false;
+  if (actual < sizeof(JobBlobHeader)) return false;
+
+  JobBlobHeader h;
+  memcpy(&h, blob, sizeof(h));
+  if (h.magic != JOB_BLOB_MAGIC || h.version != JOB_BLOB_VERSION) return false;
+  if (h.stepCount > JOB_MAX_STEPS) return false;
+  if (actual != sizeof(h) + (size_t)h.stepCount * sizeof(ZoneStep)) return false;
+
+  jobInitDefaults(j);
+  j.used         = true;
+  j.id           = h.id;
+  j.stepCount    = h.stepCount;
+  j.enabled      = h.enabled != 0;
+  j.repeat       = h.repeat;
+  j.daysMask     = h.daysMask;
+  j.onComplete   = h.onComplete;
+  j.runHour      = h.runHour;
+  j.runMinute    = h.runMinute;
+  j.runAtEpoch   = h.runAtEpoch;
+  j.lastRunEpoch = h.lastRunEpoch;
+  memcpy(j.name,   h.name,   sizeof(j.name));
+  memcpy(j.origin, h.origin, sizeof(j.origin));
+  j.name[sizeof(j.name) - 1]     = '\0';
+  j.origin[sizeof(j.origin) - 1] = '\0';
+  memcpy(j.steps, blob + sizeof(h), (size_t)h.stepCount * sizeof(ZoneStep));
+  return true;
+}
+
+// Write every slot. Called after any mutation that could touch more than one.
+void saveAllJobs() {
+  for (int i = 0; i < MAX_JOBS; i++) saveJob(i, jobs[i]);
+}
+
+// Repopulate `jobs[]` from flash and set nextJobId past the highest id seen.
+void loadAllJobs() {
+  int highest = 0;
+  for (int i = 0; i < MAX_JOBS; i++) {
+    if (loadJob(i, jobs[i])) {
+      if (jobs[i].id > highest) highest = jobs[i].id;
+    } else {
+      jobInitDefaults(jobs[i]);
+    }
+  }
+  nextJobId = highest + 1;
+}
+
+// ── Liveness marker ────────────────────────────────────────────────────────
+// Written periodically while running so that, at boot, the gap between this
+// value and the current time tells us exactly what the device slept through.
+
+bool saveLastAlive(uint32_t epoch) {
+  return kv_set(K_LAST_ALIVE, &epoch, sizeof(epoch), 0) == 0;
+}
+
+// Returns 0 when no marker has ever been written (first boot).
+uint32_t loadLastAlive() {
+  uint32_t epoch = 0;
+  size_t actual = 0;
+  if (kv_get(K_LAST_ALIVE, &epoch, sizeof(epoch), &actual) != 0) return 0;
+  if (actual != sizeof(epoch)) return 0;
+  return epoch;
 }
 
 }  // namespace storage

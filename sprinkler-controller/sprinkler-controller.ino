@@ -13,7 +13,7 @@
 //   - QRCode              by Richard Moore
 //
 // Boot flow:
-//   1. displayInit / zonesInit / schedulesInit (always)
+//   1. displayInit / zonesInit / jobsInit, then reload saved jobs from flash
 //   2. WiFi: try stored creds → fall back to hardcoded ones in config.h
 //      → final fallback enters the on-screen setup wizard (step 7)
 //   3. NTP sync
@@ -34,11 +34,12 @@
 #include "config.h"
 #include "watchdog.h"
 #include "state.h"
-#include "storage.h"
 #include "http_utils.h"
 #include "zones.h"
 #include "ntp.h"
-#include "schedules.h"
+#include "jobs.h"
+#include "storage.h"   // includes jobs.h — storage knows Job, never the reverse
+#include "missed.h"
 #include "display.h"
 #include "wifi_setup.h"
 #include "settings.h"
@@ -111,7 +112,15 @@ void setup() {
   delay(500);
   displayInit();
   zonesInit();
-  schedulesInit();
+  jobsInit();
+
+  // Jobs survive power cycles. Load them before anything can run, and give
+  // jobs.h a way to write back when the runner retires or disables one.
+  storage::loadAllJobs();
+  onJobPersistNeeded = []() { storage::saveAllJobs(); };
+  Serial.print("[boot] Loaded ");
+  Serial.print(jobCount());
+  Serial.println(" job(s) from flash");
 
   // 1. WiFi — try saved creds first
   char ssid[33] = "", pw[65] = "";
@@ -125,6 +134,11 @@ void setup() {
   }
 
   ntpInit();
+
+  // Work out what the device slept through while it was powered off. Needs a
+  // trustworthy clock, so it runs after NTP — and is retried from loop() if
+  // this first sync failed.
+  missed::scanAtBoot();
 
   // 2. Boot routing:
   //    - Server config present → STATE_RUNNING (paired)
@@ -173,10 +187,13 @@ void loop() {
   ntpUpdate();          // re-sync time once per hour
   wifi_setup::tick();   // performs the connect attempt after CONNECTING is drawn
 
+  missed::scanAtBoot();   // no-op once it has run; retries if NTP was late
+  missed::tick();         // refresh the liveness marker every few minutes
+
   if (deviceState == STATE_RUNNING) {
-    heartbeatTick();    // send keepalive to server every 60s
-    scheduleTick();     // advance the active schedule
-    schedulerCheck();   // fire any auto-run schedule whose time matches now
+    heartbeatTick();      // send keepalive to server every 60s
+    jobTick();            // advance the running job
+    jobSchedulerCheck();  // fire any job whose time has come
   }
   displayLoop();        // touch input + redraws
 
