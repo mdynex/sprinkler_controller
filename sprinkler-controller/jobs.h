@@ -513,3 +513,50 @@ void jobSchedulerCheck() {
     return;
   }
 }
+
+// ── Valve fail-safes ───────────────────────────────────────────────────────
+//
+// Nothing in this section depends on WiFi, pairing or the server: a valve that
+// is open must always have something that will close it. serviceValves() is
+// called every loop() in EVERY device state, and from inside the blocking
+// WiFi setup wizard, so neither re-pairing nor a lost network can strand a
+// zone open.
+
+extern bool needsRedraw;   // defined in display.h
+
+// Longest a zone may stay open when no job owns it — a tap on the home
+// screen, POST /zones/{id}/on, or a /command zone_on without a duration.
+// Those are latches with no end time of their own; this cap is what closes
+// one if the person or the server never sends "off". Job steps are exempt:
+// the runner already closes them when their duration is up. Override by
+// defining MANUAL_ZONE_MAX_SECONDS in config.h.
+#ifndef MANUAL_ZONE_MAX_SECONDS
+#define MANUAL_ZONE_MAX_SECONDS (60UL * 60UL)   // 1 hour
+#endif
+
+// True if zone `index` (0-based) is open because the running job's current
+// step opened it.
+static bool _zoneOwnedByJob(int index) {
+  if (!runState.running) return false;
+  Job* j = findJob(runState.jobId);
+  if (!j || runState.stepIndex >= j->stepCount) return false;
+  return j->steps[runState.stepIndex].zoneId == index + 1;
+}
+
+// Close any manually latched zone that has been open longer than the cap.
+void zoneSafetyTick() {
+  for (int i = 0; i < ZONE_COUNT; i++) {
+    if (!zoneState[i] || _zoneOwnedByJob(i)) continue;
+    if (millis() - zoneOnSince[i] < MANUAL_ZONE_MAX_SECONDS * 1000UL) continue;
+    Serial.print("[safety] Zone "); Serial.print(i + 1);
+    Serial.println(" open past the manual limit - closing");
+    setZone(i, false);
+    needsRedraw = true;
+  }
+}
+
+// Everything that can close a valve. Call every loop() regardless of state.
+void serviceValves() {
+  jobTick();
+  zoneSafetyTick();
+}

@@ -5,6 +5,8 @@
 #include "state.h"
 #include "storage.h"
 #include "display.h"
+#include "jobs.h"
+#include "missed.h"
 
 // =============================================================================
 // wifi_setup.h — On-screen WiFi provisioning
@@ -440,8 +442,19 @@ void run() {
   // Loop until we leave the wifi-setup screens (set by tick() on success).
   // This blocks for a human, so it must keep feeding the watchdog itself —
   // otherwise an unattended-but-mid-setup board would reset every 30s.
+  //
+  // It must also keep the valves serviced. At runtime this wizard opens when
+  // silent WiFi recovery gives up (a router reboot is enough), and it can sit
+  // here for hours with nobody around. If a zone was open when that happened
+  // and only loop() could close it, it would stay open until someone finished
+  // the wizard. Watering doesn't need the network, so jobs keep running and
+  // scheduled ones still fire; the liveness marker keeps going too, so this
+  // stretch isn't later mistaken for a power outage by missed.h.
   while (isActive()) {
     wdt::kick();
+    serviceValves();
+    if (deviceState == STATE_RUNNING) jobSchedulerCheck();
+    missed::tick();
     displayLoop();
     tick();
   }

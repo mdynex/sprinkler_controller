@@ -39,10 +39,17 @@ void zonesInit() {
   }
 }
 
+// millis() of the last command that turned each zone on. Every "on" refreshes
+// it, so a caller that deliberately keeps a zone open can re-assert it. Read
+// by zoneSafetyTick() in jobs.h to close manually latched zones that have been
+// open too long.
+unsigned long zoneOnSince[ZONE_COUNT] = {0};
+
 // Turn a single zone on or off. index is 0-based.
 void setZone(int index, bool on) {
   if (index < 0 || index >= ZONE_COUNT) return;
   zoneState[index] = on;
+  if (on) zoneOnSince[index] = millis();
   digitalWrite(ZONE_PINS[index], on ? LOW : HIGH);
 }
 

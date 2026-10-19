@@ -41,3 +41,9 @@ const int SLEEP_TIMEOUT_SEC = 60;
 // Friendly default shown on the pairing screen and pre-filled in the app's
 // Add Device sheet. The user can rename the device when they claim it.
 const char* DEVICE_NAME = "Sprinkler Controller";
+
+// ── Safety ──────────────────────────────────────────────────────────────────
+// Optional. Longest a zone may stay open when it was turned on by hand (home
+// screen tap, POST /zones/{id}/on, or a /command zone_on with no duration).
+// Scheduled job steps are not affected. Default is 1 hour (see jobs.h).
+// #define MANUAL_ZONE_MAX_SECONDS (60UL * 60UL)

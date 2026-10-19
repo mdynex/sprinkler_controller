@@ -190,9 +190,13 @@ void loop() {
   missed::scanAtBoot();   // no-op once it has run; retries if NTP was late
   missed::tick();         // refresh the liveness marker every few minutes
 
+  // Close valves on time in EVERY state, not just STATE_RUNNING: a job can
+  // still be running after Settings → Re-pair, or be started late by the
+  // missed-job scan on an unpaired boot, and nothing else would close it.
+  serviceValves();
+
   if (deviceState == STATE_RUNNING) {
     heartbeatTick();      // send keepalive to server every 60s
-    jobTick();            // advance the running job
     jobSchedulerCheck();  // fire any job whose time has come
   }
   displayLoop();        // touch input + redraws
