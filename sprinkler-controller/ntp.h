@@ -1,6 +1,7 @@
 #pragma once
 #include <WiFiUDP.h>
 #include "config.h"
+#include "tz.h"
 
 // =============================================================================
 // ntp.h — Network Time Protocol (NTP) client
@@ -17,17 +18,52 @@
 //      in the 32-bit "Transmit Timestamp" field at bytes 40–43.
 //   3. Convert from NTP epoch (Jan 1 1900) to Unix epoch (Jan 1 1970) by
 //      subtracting 70 years worth of seconds (2208988800).
-//   4. Add UTC_OFFSET_SECONDS from config.h to get local time.
+//   4. Convert to local time with the TZ_RULE from config.h, which knows
+//      about daylight saving. Without a TZ_RULE the fixed UTC_OFFSET_SECONDS
+//      is used (no DST — the old behaviour).
 //   5. Between syncs, advance the clock using millis() so it stays accurate
 //      without hitting the server every second.
+//
+// "Local epoch" (ntpEpoch(), job run_at/last_run) means local wall-clock time
+// counted as if it were UTC. The server relies on that, so it's unchanged;
+// only the offset now follows DST.
 // =============================================================================
 
 static WiFiUDP        _ntpUDP;
-static unsigned long  _epochAtSync  = 0;   // Unix epoch (local) at last successful sync
+static unsigned long  _epochAtSync  = 0;   // Unix epoch (UTC) at last successful sync
 static unsigned long  _millisAtSync = 0;   // millis() value at last successful sync
 static unsigned long  _lastSyncAttempt = 0;
 
+// Retry quickly until the first sync lands — nothing time-based (jobs, the
+// missed-job scan, the clock) works without it — then hourly. A failed
+// hourly resync tries again sooner, since the clock is still drifting.
+static const unsigned long NTP_RETRY_UNSYNCED_MS = 60000UL;      // 1 min
+static const unsigned long NTP_RETRY_FAILED_MS   = 300000UL;     // 5 min
+static const unsigned long NTP_RESYNC_MS         = 3600000UL;    // 1 hour
+static unsigned long       _nextSyncDelay        = NTP_RETRY_UNSYNCED_MS;
+
 bool ntpReady = false;  // true once the first successful sync completes
+
+// Time zone: a POSIX TZ rule (with DST) if config.h defines TZ_RULE,
+// otherwise the fixed offset. Parsed once, on first use.
+static TzInfo _tz;
+static bool   _tzLoaded = false;
+
+static const TzInfo& _tzInfo() {
+  if (!_tzLoaded) {
+    _tzLoaded = true;
+    _tz = {};
+    _tz.stdOffset = (int32_t)UTC_OFFSET_SECONDS;
+#ifdef TZ_RULE
+    if (!tzParse(TZ_RULE, &_tz)) {
+      _tz = {};
+      _tz.stdOffset = (int32_t)UTC_OFFSET_SECONDS;
+      Serial.println("[ntp] TZ_RULE not understood - using UTC_OFFSET_SECONDS (no DST)");
+    }
+#endif
+  }
+  return _tz;
+}
 
 // Send one NTP request and wait up to 2 seconds for a reply.
 // Returns true and updates _epochAtSync on success.
@@ -56,6 +92,9 @@ static bool _ntpRequest() {
       // Transmit Timestamp is at bytes 40–43 (two 16-bit words, big-endian)
       unsigned long hi    = (unsigned long)pkt[40] << 8 | pkt[41];
       unsigned long lo    = (unsigned long)pkt[42] << 8 | pkt[43];
+      // Ignore anything that isn't a sane server reply (mode 4, a real
+      // stratum, a non-zero time) — a bad packet would move every schedule.
+      if ((pkt[0] & 0x07) != 4 || pkt[1] == 0 || (hi | lo) == 0) { delay(10); continue; }
       unsigned long epoch = (hi << 16 | lo) - 2208988800UL;  // NTP → Unix epoch
       _epochAtSync  = epoch;
       _millisAtSync = millis();
@@ -68,9 +107,17 @@ static bool _ntpRequest() {
 
 // Returns the current local Unix epoch, estimated from the last sync plus
 // elapsed millis() so we don't need to hit the server every second.
+static unsigned long _nowUtc() {
+  return _epochAtSync + (millis() - _millisAtSync) / 1000UL;
+}
+
+// Offset from UTC in effect right now, in seconds (DST-aware).
+long ntpUtcOffset() {
+  return (long)tzOffsetAt(_tzInfo(), (int64_t)_nowUtc());
+}
+
 static unsigned long _nowEpoch() {
-  unsigned long elapsed = (millis() - _millisAtSync) / 1000UL;
-  return _epochAtSync + elapsed + UTC_OFFSET_SECONDS;
+  return _nowUtc() + ntpUtcOffset();
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────
@@ -78,21 +125,32 @@ static unsigned long _nowEpoch() {
 // Call once after WiFi connects. Opens the UDP socket and does the first sync.
 void ntpInit() {
   _ntpUDP.begin(2390);  // local port for receiving NTP replies
+  _lastSyncAttempt = millis();
   if (_ntpRequest()) {
     ntpReady = true;
-    _lastSyncAttempt = millis();
+    _nextSyncDelay = NTP_RESYNC_MS;
     Serial.print("Time synced: ");
-    Serial.println(_nowEpoch());
+    Serial.print(_nowEpoch());
+    Serial.print("  utc_offset=");
+    Serial.println(ntpUtcOffset());
   } else {
-    Serial.println("NTP sync failed — will retry in loop()");
+    _nextSyncDelay = NTP_RETRY_UNSYNCED_MS;
+    Serial.println("NTP sync failed — retrying every minute");
   }
 }
 
-// Call every loop(). Re-syncs with the server once per hour.
+// Call every loop(). Retries every minute until the first sync, then
+// re-syncs hourly (every 5 minutes after a failed resync).
 void ntpUpdate() {
-  if (millis() - _lastSyncAttempt < 3600000UL) return;
+  if (millis() - _lastSyncAttempt < _nextSyncDelay) return;
   _lastSyncAttempt = millis();
-  if (_ntpRequest()) ntpReady = true;
+  if (_ntpRequest()) {
+    if (!ntpReady) Serial.println("[ntp] First sync done");
+    ntpReady = true;
+    _nextSyncDelay = NTP_RESYNC_MS;
+  } else {
+    _nextSyncDelay = ntpReady ? NTP_RETRY_FAILED_MS : NTP_RETRY_UNSYNCED_MS;
+  }
 }
 
 // Current local hour (0–23), minute (0–59), second (0–59).
@@ -119,5 +177,6 @@ String currentTimeJson() {
   if (!ntpReady) return "{\"synced\":false}";
   char buf[9];
   snprintf(buf, sizeof(buf), "%02d:%02d:%02d", ntpHour(), ntpMinute(), ntpSecond());
-  return "{\"synced\":true,\"time\":\"" + String(buf) + "\",\"epoch\":" + String(_nowEpoch()) + "}";
+  return "{\"synced\":true,\"time\":\"" + String(buf) + "\",\"epoch\":" + String(_nowEpoch()) +
+         ",\"utc_offset\":" + String(ntpUtcOffset()) + "}";
 }

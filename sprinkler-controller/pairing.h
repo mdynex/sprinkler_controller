@@ -141,29 +141,58 @@ void _handlePairingTouch(int tx, int ty) {
 }
 
 // ── POST /provision handler ─────────────────────────────────────────────────
+//
+// The 6-digit code is only 10^6 guesses, so wrong attempts are limited: after
+// MAX_CLAIM_FAILURES misses the code and secret are replaced (the screen
+// shows the new ones) and /provision answers 429 for CLAIM_LOCKOUT_MS. That
+// caps a LAN attacker at a few guesses a minute against a code that keeps
+// changing, while someone who mistypes just reads the new code.
+
+extern void generateClaimSecret();   // sprinkler-controller.ino
+
+constexpr int           MAX_CLAIM_FAILURES = 5;
+constexpr unsigned long CLAIM_LOCKOUT_MS   = 60000UL;
+
+static int           _claimFailures   = 0;
+static bool          _claimLocked     = false;
+static unsigned long _claimLockedAtMs = 0;
 
 void routeProvision(WiFiClient& client, HttpRequest& req) {
   if (deviceState != STATE_PAIRING) {
     sendResponse(client, 409, "{\"error\":\"already paired\"}");
     return;
   }
+  if (_claimLocked) {
+    if (millis() - _claimLockedAtMs < CLAIM_LOCKOUT_MS) {
+      sendResponse(client, 429, "{\"error\":\"too many wrong codes, try again in a minute\"}");
+      return;
+    }
+    _claimLocked = false;
+  }
+
   // Accept either form: QR encodes the full 16-hex `claimSecret`,
   // manual entry uses the 6-digit `claimCode`.
-  Serial.print("[provision] Received secret: '");
-  Serial.print(req.claimSecret);
-  Serial.print("' (len=");
-  Serial.print(req.claimSecret.length());
-  Serial.print(")  Expected secret: '");
-  Serial.print(claimSecret);
-  Serial.print("' code: '");
-  Serial.print(claimCode);
-  Serial.println("'");
-
-  if (req.claimSecret != String(claimSecret) &&
-      req.claimSecret != String(claimCode)) {
+  const char* got = req.claimSecret.c_str();
+  if (!secretsEqual(got, claimSecret) && !secretsEqual(got, claimCode)) {
+    _claimFailures++;
+    Serial.print("[provision] Wrong claim code (");
+    Serial.print(_claimFailures);
+    Serial.print("/");
+    Serial.print(MAX_CLAIM_FAILURES);
+    Serial.println(")");
+    if (_claimFailures >= MAX_CLAIM_FAILURES) {
+      Serial.println("[provision] Too many wrong codes - new code, locked for 60s");
+      generateClaimSecret();
+      invalidatePairingQR();
+      needsRedraw      = true;
+      _claimFailures   = 0;
+      _claimLocked     = true;
+      _claimLockedAtMs = millis();
+    }
     sendResponse(client, 401, "{\"error\":\"invalid claim secret\"}");
     return;
   }
+  _claimFailures = 0;
 
   StaticJsonDocument<512> doc;
   if (deserializeJson(doc, req.body) != DeserializationError::Ok) {

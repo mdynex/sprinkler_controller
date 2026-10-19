@@ -26,6 +26,14 @@
 //   UTC+1  Berlin   =   3600
 const long UTC_OFFSET_SECONDS = -21600;
 
+// Daylight saving. A POSIX TZ rule; when set it replaces UTC_OFFSET_SECONDS
+// and moves the clock for DST automatically. Comment it out to use the
+// fixed offset above.
+//   US Central  "CST6CDT,M3.2.0,M11.1.0"     US Eastern "EST5EDT,M3.2.0,M11.1.0"
+//   US Mountain "MST7MDT,M3.2.0,M11.1.0"     US Pacific "PST8PDT,M3.2.0,M11.1.0"
+//   Arizona     "MST7"                       UK         "GMT0BST,M3.5.0/1,M10.5.0"
+#define TZ_RULE "CST6CDT,M3.2.0,M11.1.0"
+
 // ── Zones ──────────────────────────────────────────────────────────────────
 // One digital output pin per sprinkler zone.
 // These must match how IN1–IN8 on your relay module are wired to the Giga R1.
@@ -41,3 +49,9 @@ const int SLEEP_TIMEOUT_SEC = 60;
 // Friendly default shown on the pairing screen and pre-filled in the app's
 // Add Device sheet. The user can rename the device when they claim it.
 const char* DEVICE_NAME = "Sprinkler Controller";
+
+// ── Safety ──────────────────────────────────────────────────────────────────
+// Optional. Longest a zone may stay open when it was turned on by hand (home
+// screen tap, POST /zones/{id}/on, or a /command zone_on with no duration).
+// Scheduled job steps are not affected. Default is 1 hour (see jobs.h).
+// #define MANUAL_ZONE_MAX_SECONDS (60UL * 60UL)

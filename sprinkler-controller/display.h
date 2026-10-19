@@ -3,7 +3,8 @@
 #include <Arduino_GigaDisplayTouch.h>
 #include <Arduino_GigaDisplay.h>
 #include "zones.h"
-#include "schedules.h"
+#include "jobs.h"
+#include "storage.h"
 #include "ntp.h"
 
 // ── Colors (RGB565) ────────────────────────────────────────────────────────
@@ -108,12 +109,12 @@ void _onTouch(uint8_t contacts, GDTpoint_t* pts) {
 }
 
 // ── Edit screen state ──────────────────────────────────────────────────────
-uint8_t _editDaysMask = 0;   // bit 0=Sun ... 6=Sat. 0 = manual only.
+uint8_t _editDaysMask = 0;   // bit 0=Sun ... 6=Sat. 0 = run once (no repeat).
 int     _editHour     = 6;
 int     _editMin      = 0;
 int     _editStepsPage = 0;  // 0-indexed page of the zone step list
 
-// ── New-schedule builder state ─────────────────────────────────────────────
+// ── New-job builder state ──────────────────────────────────────────────────
 bool    _newZones[ZONE_COUNT] = {false};
 int     _newDuration          = 10;  // minutes, 1..120
 int     _newHour              = 6;
@@ -124,22 +125,73 @@ uint8_t _newDaysMask          = 0x7F;  // default to all days
 #define ZS_ZONES_PER_PAGE  4
 int _zoneSettingsPage = 0;   // 0 = zones 1-4, 1 = zones 5-8, etc.
 
-// Load only the auto-run settings from the schedule into edit state.
+// ── Job list state ─────────────────────────────────────────────────────────
+#define SL_ROWS_PER_PAGE  4
+int _schedPage        = 0;   // 0-indexed page of the job list
+int _selectedJobIndex = -1;  // slot in jobs[] the EDIT screen is working on
+
+// Collect the slot indices of every used job, in slot order.
+// Returns how many were written to `out`.
+int _usedJobIndices(int* out, int maxOut) {
+  int n = 0;
+  for (int i = 0; i < MAX_JOBS && n < maxOut; i++) {
+    if (jobs[i].used) out[n++] = i;
+  }
+  return n;
+}
+
+// The job the EDIT screen is editing, or nullptr if it went away underneath
+// us (deleted by the server, or retired by its own on_complete policy).
+Job* _selectedJob() {
+  if (_selectedJobIndex < 0 || _selectedJobIndex >= MAX_JOBS) return nullptr;
+  if (!jobs[_selectedJobIndex].used) return nullptr;
+  return &jobs[_selectedJobIndex];
+}
+
+// Load the selected job's repeat settings into edit state.
 // Zone steps are managed by the app and are not editable on the display.
 void _loadEditState() {
-  _editDaysMask  = theSchedule.daysMask;
-  _editHour      = theSchedule.runHour;
-  _editMin       = theSchedule.runMinute;
+  Job* j = _selectedJob();
+  if (!j) return;
+  _editDaysMask  = (j->repeat == REPEAT_NONE) ? 0 : j->daysMask;
+  _editHour      = j->runHour;
+  _editMin       = j->runMinute;
   _editStepsPage = 0;
 }
 
-// Save only the auto-run settings back to the schedule.
-// Zone steps are left untouched.
+// Save the repeat settings back to the selected job. Zone steps are untouched.
+//
+// Clearing every day turns the job back into a one-shot; setting any day
+// promotes it to a schedule. That is the whole "run command becomes a
+// schedule" gesture, and it also has to fix up on_complete — a promoted run
+// command that kept on_complete=delete would vanish after its first run.
 void _saveEditState() {
-  theSchedule.daysMask  = _editDaysMask;
-  theSchedule.autoRun   = (_editDaysMask != 0);
-  theSchedule.runHour   = _editHour;
-  theSchedule.runMinute = _editMin;
+  Job* j = _selectedJob();
+  if (!j) return;
+  uint8_t wasRepeat = j->repeat;
+
+  j->daysMask  = _editDaysMask;
+  j->runHour   = _editHour;
+  j->runMinute = _editMin;
+
+  if (_editDaysMask == 0)          j->repeat = REPEAT_NONE;
+  else if (_editDaysMask == 0x7F)  j->repeat = REPEAT_DAILY;
+  else                             j->repeat = REPEAT_WEEKLY;
+
+  if (j->repeat != wasRepeat) {
+    j->onComplete = (j->repeat == REPEAT_NONE) ? ON_COMPLETE_DELETE
+                                               : ON_COMPLETE_KEEP;
+    // A job edited into a one-shot needs a concrete time to fire at, or the
+    // scheduler would never pick it up.
+    if (j->repeat == REPEAT_NONE && ntpReady) {
+      uint32_t today = (ntpEpoch() / 86400UL) * 86400UL;
+      uint32_t fire  = today + (uint32_t)_editHour * 3600UL
+                             + (uint32_t)_editMin * 60UL;
+      if (fire <= (uint32_t)ntpEpoch()) fire += 86400UL;   // already passed → tomorrow
+      j->runAtEpoch = fire;
+    }
+  }
+  storage::saveAllJobs();
 }
 
 // ── Sleep / wake ───────────────────────────────────────────────────────────
@@ -223,18 +275,23 @@ void _drawStatusBar() {
   gfx.setTextColor(C_DIM);
   gfx.setTextSize(1);
   gfx.setCursor(10, STS_Y + 14);
-  if (runState.running) {
-    ZoneStep& step = theSchedule.steps[runState.stepIndex];
+  Job* running = runState.running ? findJob(runState.jobId) : nullptr;
+  if (running && runState.stepIndex < running->stepCount) {
+    ZoneStep& step = running->steps[runState.stepIndex];
     unsigned long elapsed   = (millis() - runState.stepStart) / 1000UL;
     unsigned long remaining = step.duration > (int)elapsed ? step.duration - elapsed : 0;
     gfx.print("Running: ");
-    gfx.print(theSchedule.name);
-    gfx.print("  |  Zone ");
-    gfx.print(step.zoneId);
+    gfx.print(running->name);
+    if (step.zoneId == 0) {
+      gfx.print("  |  Soaking");
+    } else {
+      gfx.print("  |  Zone ");
+      gfx.print(step.zoneId);
+    }
     gfx.print("  |  Step ");
     gfx.print(runState.stepIndex + 1);
     gfx.print("/");
-    gfx.print(theSchedule.stepCount);
+    gfx.print(running->stepCount);
     gfx.print("  |  ");
     gfx.print(remaining);
     gfx.print("s remaining");
@@ -316,7 +373,7 @@ void _handleHomeTouch(int tx, int ty) {
   if (_inRect(tx, ty,  20, NAV_Y + 10, 220, 50)) { currentScreen = SCR_SCHEDULES;    needsRedraw = true; return; }
   if (_inRect(tx, ty, 290, NAV_Y + 10, 220, 50)) { currentScreen = SCR_ZONE_SETTINGS; needsRedraw = true; return; }
   if (_inRect(tx, ty, 560, NAV_Y + 10, 220, 50)) {
-    stopSchedule();
+    stopJob();
     for (int i = 0; i < ZONE_COUNT; i++) _drawZoneBtn(i);
     _drawStatusBar();
   }
@@ -369,42 +426,75 @@ void _formatDaysMask(uint8_t mask, char* out, size_t outLen) {
   }
 }
 
-// ── SCHEDULES screen ───────────────────────────────────────────────────────
+// ── JOBS screen ────────────────────────────────────────────────────────────
+//
+// One list holds both kinds of entry. A row is a "run command" when the job
+// doesn't repeat and a "schedule" when it does — same list, same controls.
+// Every row can be toggled off (ON/OFF) and opened for edit/delete.
 
 #define SL_ROW_H    55
 #define SL_ROW_GAP   8
 #define SL_LIST_Y   (HDR_H + 5)
 #define SL_RUN_X    (SCR_W - 140)
+#define SL_TOG_X    (SCR_W - 250)
+#define SL_TOG_W    100
 
-void _drawSchedRow(int screenRow) {
-  int y = SL_LIST_Y + screenRow * (SL_ROW_H + SL_ROW_GAP);
-  bool active = runState.running;
-  gfx.fillRoundRect(10, y, SCR_W - 20, SL_ROW_H, 6, active ? 0x0343 : C_DARKGRAY);
+// Describe when a job next runs, e.g. "MoWeFr 06:00" or "Once 06:00".
+static void _formatJobWhen(const Job& j, char* out, size_t outLen) {
+  char tbuf[8];
+  snprintf(tbuf, sizeof(tbuf), "%02d:%02d", j.runHour, j.runMinute);
+  if (j.repeat == REPEAT_NONE) {
+    snprintf(out, outLen, "Once  %s", tbuf);
+  } else if (j.repeat == REPEAT_DAILY) {
+    snprintf(out, outLen, "Daily  %s", tbuf);
+  } else {
+    char days[32];
+    _formatDaysMask(j.daysMask, days, sizeof(days));
+    snprintf(out, outLen, "%s  %s", days, tbuf);
+  }
+}
 
-  gfx.setTextColor(C_WHITE);
+// Draw the job at jobs[slot] into the given on-screen row.
+void _drawSchedRow(int screenRow, int slot) {
+  const Job& j = jobs[slot];
+  int  y      = SL_LIST_Y + screenRow * (SL_ROW_H + SL_ROW_GAP);
+  bool active = jobIsRunning(j);
+
+  uint16_t bg = active     ? 0x0343        // green-ish while watering
+              : j.enabled  ? C_DARKGRAY
+                           : C_GRAY;       // dimmed when switched off
+  gfx.fillRoundRect(10, y, SCR_W - 20, SL_ROW_H, 6, bg);
+
+  gfx.setTextColor(j.enabled ? C_WHITE : C_DIM);
   gfx.setTextSize(2);
   gfx.setCursor(20, y + 10);
-  gfx.print(theSchedule.name);
+  gfx.print(j.name);
 
   gfx.setTextSize(1);
-  gfx.setTextColor(theSchedule.daysMask != 0 ? C_ORANGE : C_DIM);
+  gfx.setTextColor(j.repeat != REPEAT_NONE ? C_ORANGE : C_DIM);
   gfx.setCursor(20, y + 36);
-  if (theSchedule.daysMask != 0) {
-    char days[32];
-    _formatDaysMask(theSchedule.daysMask, days, sizeof(days));
-    gfx.print(days);
-    gfx.print("  ");
-    char tbuf[8];
-    snprintf(tbuf, sizeof(tbuf), "%02d:%02d", theSchedule.runHour, theSchedule.runMinute);
-    gfx.print(tbuf);
-  } else {
-    gfx.print("Manual only");
+  char when[48];
+  _formatJobWhen(j, when, sizeof(when));
+  gfx.print(when);
+
+  // One-shots that clean up after themselves say so, so a row that is about
+  // to disappear doesn't look like a bug.
+  if (j.onComplete == ON_COMPLETE_DELETE) {
+    gfx.setTextColor(C_DIM);
+    gfx.print("  (deletes after run)");
+  } else if (j.onComplete == ON_COMPLETE_DISABLE) {
+    gfx.setTextColor(C_DIM);
+    gfx.print("  (turns off after run)");
   }
 
   gfx.setTextColor(C_DIM);
-  gfx.setCursor(270, y + 22);
-  gfx.print(theSchedule.stepCount);
-  gfx.print(" zones");
+  gfx.setCursor(340, y + 22);
+  gfx.print(j.stepCount);
+  gfx.print(" steps");
+
+  _btn(SL_TOG_X, y + 9, SL_TOG_W, SL_ROW_H - 18,
+       j.enabled ? C_BLUE : C_GRAY,
+       j.enabled ? "ON" : "OFF", 2);
 
   _btn(SL_RUN_X, y + 9, 120, SL_ROW_H - 18,
        active ? C_RED : C_GREEN,
@@ -414,82 +504,146 @@ void _drawSchedRow(int screenRow) {
 
 void _drawSchedulesScreen() {
   gfx.fillScreen(C_BG);
-  _drawHeader("SCHEDULES");
-  if (theSchedule.used) {
-    _drawSchedRow(0);
-  } else {
+  _drawHeader("JOBS");
+
+  int idx[MAX_JOBS];
+  int total = _usedJobIndices(idx, MAX_JOBS);
+  int pages = total == 0 ? 1 : (total + SL_ROWS_PER_PAGE - 1) / SL_ROWS_PER_PAGE;
+  if (_schedPage >= pages) _schedPage = pages - 1;
+  if (_schedPage < 0)      _schedPage = 0;
+
+  if (total == 0) {
     gfx.setTextColor(C_DIM);
     gfx.setTextSize(2);
     gfx.setCursor(20, HDR_H + 40);
-    gfx.print("No schedule yet.");
+    gfx.print("No jobs yet.");
     gfx.setTextSize(1);
     gfx.setCursor(20, HDR_H + 70);
     gfx.print("Create one on this device, or send one from the app.");
 
-    // Big tappable CREATE button in the centre
-    _btn(SCR_W / 2 - 175, HDR_H + 110, 350, 70, C_BLUE,
-         "+ CREATE NEW SCHEDULE", 2);
+    _btn(SCR_W / 2 - 175, HDR_H + 110, 350, 70, C_BLUE, "+ CREATE NEW JOB", 2);
+  } else {
+    int start = _schedPage * SL_ROWS_PER_PAGE;
+    for (int r = 0; r < SL_ROWS_PER_PAGE && start + r < total; r++) {
+      _drawSchedRow(r, idx[start + r]);
+    }
   }
+
   gfx.fillRect(0, NAV_Y, SCR_W, NAV_H, C_BG);
-  _btn(20,          NAV_Y + 10, 160, 50, C_GRAY, "BACK");
-  _btn(SCR_W - 250, NAV_Y + 10, 230, 50, C_RED,  "STOP ALL");
+  _btn(20, NAV_Y + 10, 160, 50, C_GRAY, "BACK");
+
+  if (total > 0) {
+    // "+ NEW" is only reachable here once at least one job exists; the empty
+    // state has its own big button.
+    _btn(200, NAV_Y + 10, 130, 50, C_BLUE, "+ NEW", 2);
+  }
+  if (pages > 1) {
+    _btn(350, NAV_Y + 10, 60, 50, C_GRAY, "<", 2);
+    _btn(420, NAV_Y + 10, 60, 50, C_GRAY, ">", 2);
+    gfx.setTextColor(C_DIM);
+    gfx.setTextSize(1);
+    gfx.setCursor(350, NAV_Y + 2);
+    gfx.print("Page ");
+    gfx.print(_schedPage + 1);
+    gfx.print("/");
+    gfx.print(pages);
+  }
+  _btn(SCR_W - 250, NAV_Y + 10, 230, 50, C_RED, "STOP ALL");
   _drawStatusBar();
+}
+
+// Reset the on-device builder to defaults and open it.
+static void _openNewJobBuilder() {
+  for (int i = 0; i < ZONE_COUNT; i++) _newZones[i] = false;
+  _newDuration = 10;
+  _newHour     = 6;
+  _newMin      = 0;
+  _newDaysMask = 0x7F;   // default to every day (user can refine on step 2)
+  currentScreen = SCR_NEW_SCHEDULE;
+  needsRedraw = true;
 }
 
 void _handleSchedulesTouch(int tx, int ty) {
   if (_inRect(tx, ty, 20, NAV_Y + 10, 160, 50)) { currentScreen = SCR_HOME; needsRedraw = true; return; }
 
-  // STOP ALL button
+  // STOP ALL
   if (_inRect(tx, ty, SCR_W - 250, NAV_Y + 10, 230, 50)) {
-    stopSchedule();
-    if (theSchedule.used) _drawSchedRow(0);
-    _drawStatusBar();
-    return;
-  }
-
-  if (!theSchedule.used) {
-    // CREATE NEW SCHEDULE button (only visible when there's no schedule)
-    if (_inRect(tx, ty, SCR_W / 2 - 175, HDR_H + 110, 350, 70)) {
-      // Reset builder state to sensible defaults
-      for (int i = 0; i < ZONE_COUNT; i++) _newZones[i] = false;
-      _newDuration = 10;
-      _newHour     = 6;
-      _newMin      = 0;
-      _newDaysMask = 0x7F;   // default to every day (user can refine on step 2)
-      currentScreen = SCR_NEW_SCHEDULE;
-      needsRedraw = true;
-    }
-    return;
-  }
-  int y = SL_LIST_Y;
-
-  // Run/Stop button — redraw just the row + status bar
-  if (_inRect(tx, ty, SL_RUN_X, y + 9, 120, SL_ROW_H - 18)) {
-    if (runState.running) stopSchedule();
-    else startSchedule();
-    _drawSchedRow(0);
-    _drawStatusBar();
-    return;
-  }
-  // Row body → edit screen
-  if (_inRect(tx, ty, 10, y, SCR_W - 20, SL_ROW_H)) {
-    _loadEditState();
-    currentScreen = SCR_EDIT;
+    stopJob();
     needsRedraw = true;
+    return;
+  }
+
+  int idx[MAX_JOBS];
+  int total = _usedJobIndices(idx, MAX_JOBS);
+  int pages = total == 0 ? 1 : (total + SL_ROWS_PER_PAGE - 1) / SL_ROWS_PER_PAGE;
+
+  if (total == 0) {
+    if (_inRect(tx, ty, SCR_W / 2 - 175, HDR_H + 110, 350, 70)) _openNewJobBuilder();
+    return;
+  }
+
+  if (_inRect(tx, ty, 200, NAV_Y + 10, 130, 50)) { _openNewJobBuilder(); return; }
+
+  if (pages > 1) {
+    if (_inRect(tx, ty, 350, NAV_Y + 10, 60, 50)) {
+      if (_schedPage > 0) { _schedPage--; needsRedraw = true; }
+      return;
+    }
+    if (_inRect(tx, ty, 420, NAV_Y + 10, 60, 50)) {
+      if (_schedPage < pages - 1) { _schedPage++; needsRedraw = true; }
+      return;
+    }
+  }
+
+  int start = _schedPage * SL_ROWS_PER_PAGE;
+  for (int r = 0; r < SL_ROWS_PER_PAGE && start + r < total; r++) {
+    int slot = idx[start + r];
+    int y    = SL_LIST_Y + r * (SL_ROW_H + SL_ROW_GAP);
+    Job& j   = jobs[slot];
+
+    // RUN / STOP
+    if (_inRect(tx, ty, SL_RUN_X, y + 9, 120, SL_ROW_H - 18)) {
+      if (jobIsRunning(j)) stopJob();
+      else                 startJob(j);
+      needsRedraw = true;
+      return;
+    }
+
+    // ON / OFF — a disabled job stays in the list but never fires
+    if (_inRect(tx, ty, SL_TOG_X, y + 9, SL_TOG_W, SL_ROW_H - 18)) {
+      j.enabled = !j.enabled;
+      if (!j.enabled && jobIsRunning(j)) stopJob();
+      storage::saveAllJobs();
+      needsRedraw = true;
+      return;
+    }
+
+    // Row body → edit screen
+    if (_inRect(tx, ty, 10, y, SCR_W - 20, SL_ROW_H)) {
+      _selectedJobIndex = slot;
+      _loadEditState();
+      currentScreen = SCR_EDIT;
+      needsRedraw = true;
+      return;
+    }
   }
 }
 
 // ── EDIT screen ────────────────────────────────────────────────────────────
-// Shows the full zone-step list, day-of-week toggles, time, and DELETE.
+// Shows the full zone-step list, day-of-week toggles, time, and DELETE, for
+// the job selected on the list screen (_selectedJobIndex).
 //
-// Origin handling: `theSchedule.origin` is "server" (pushed from the app /
-// recommendation engine — complex multi-zone soak structure, treat steps as
-// read-only here, user edits it in the app) or "device" (built locally via
-// SCR_NEW_SCHEDULE → SCR_NEW_DAYS — simple shape, all changes safe). Both
-// flavours allow editing time + days + DELETE on this screen. Per-step zone
-// edits are not implemented yet for either; when they are, gate them on
-// origin == "device" so server-owned structures aren't accidentally
-// flattened by the on-device editor.
+// Selecting no days makes the job a one-shot run command; selecting any day
+// promotes it to a repeating schedule. See _saveEditState().
+//
+// Origin handling: `origin` is "server" (pushed from the app / recommendation
+// engine — complex multi-zone soak structure, treat steps as read-only here,
+// user edits it in the app) or "device" (built locally via SCR_NEW_SCHEDULE →
+// SCR_NEW_DAYS — simple shape, all changes safe). Both flavours allow editing
+// time + days + DELETE on this screen. Per-step zone edits are not implemented
+// yet for either; when they are, gate them on origin == "device" so
+// server-owned structures aren't accidentally flattened by the on-device
+// editor.
 
 #define ED_STEPS_Y    (HDR_H + 30)   // y of the "ZONES (...)" header row
 #define ED_ROW_OFF    30             // first step row sits this far below header
@@ -501,12 +655,23 @@ void _handleSchedulesTouch(int tx, int ty) {
 
 void _drawEditScreen() {
   gfx.fillScreen(C_BG);
+
+  Job* jp = _selectedJob();
+  if (!jp) {
+    // The job vanished while this screen was open — deleted from the app, or
+    // retired by its own on_complete policy. Bounce back to the list.
+    currentScreen = SCR_SCHEDULES;
+    needsRedraw = true;
+    return;
+  }
+  Job& job = *jp;
+
   char title[48];
-  snprintf(title, sizeof(title), "EDIT: %s", theSchedule.name);
+  snprintf(title, sizeof(title), "EDIT: %s", job.name);
   _drawHeader(title);
 
   // Zone step list — paginated. ED_STEPS_MAX steps per page.
-  int totalSteps = theSchedule.stepCount;
+  int totalSteps = job.stepCount;
   int totalPages = totalSteps == 0 ? 1 : (totalSteps + ED_STEPS_MAX - 1) / ED_STEPS_MAX;
   if (_editStepsPage >= totalPages) _editStepsPage = totalPages - 1;
   int startIdx = _editStepsPage * ED_STEPS_MAX;
@@ -522,7 +687,7 @@ void _drawEditScreen() {
   // Origin badge — small pill next to the step header. "FROM APP" for
   // server-pushed schedules (steps are the engine's, edit in the app),
   // "ON-DEVICE" for locally authored ones (simple shape, fully editable).
-  bool isDeviceOrigin = (strcmp(theSchedule.origin, "device") == 0);
+  bool isDeviceOrigin = (strcmp(job.origin, "device") == 0);
   const char* badgeText = isDeviceOrigin ? "ON-DEVICE" : "FROM APP";
   uint16_t    badgeBg   = isDeviceOrigin ? C_GREEN    : C_BLUE;
   uint16_t    badgeFg   = isDeviceOrigin ? C_BLACK    : C_WHITE;
@@ -551,24 +716,30 @@ void _drawEditScreen() {
     int row = i - startIdx;
     int y   = ED_STEPS_Y + ED_ROW_OFF + row * ED_STEP_H;
     char line[40];
-    int mins = theSchedule.steps[i].duration / 60;
-    int secs = theSchedule.steps[i].duration % 60;
-    if (secs == 0) {
-      snprintf(line, sizeof(line), "  %d. Zone %d:  %d min",
-               i + 1, theSchedule.steps[i].zoneId, mins);
+    int zoneId = job.steps[i].zoneId;
+    int mins   = job.steps[i].duration / 60;
+    int secs   = job.steps[i].duration % 60;
+    // Zone 0 is an idle step — a soak pause between cycles, not a valve.
+    const char* what = (zoneId == 0) ? "Soak" : "Zone";
+    if (zoneId == 0) {
+      if (secs == 0) snprintf(line, sizeof(line), "  %d. %s:      %d min", i + 1, what, mins);
+      else           snprintf(line, sizeof(line), "  %d. %s:      %d:%02d", i + 1, what, mins, secs);
+    } else if (secs == 0) {
+      snprintf(line, sizeof(line), "  %d. %s %d:  %d min", i + 1, what, zoneId, mins);
     } else {
-      snprintf(line, sizeof(line), "  %d. Zone %d:  %d:%02d",
-               i + 1, theSchedule.steps[i].zoneId, mins, secs);
+      snprintf(line, sizeof(line), "  %d. %s %d:  %d:%02d", i + 1, what, zoneId, mins, secs);
     }
     gfx.setTextColor(C_WHITE); gfx.setTextSize(2);
     gfx.setCursor(20, y);
     gfx.print(line);
   }
 
-  // Days of week — tap to toggle each. Empty mask = manual only.
+  // Days of week — tap to toggle each. This is the run-command/schedule
+  // switch: no days selected means the job runs once and retires.
   gfx.setTextColor(C_DIM); gfx.setTextSize(1);
   gfx.setCursor(20, ED_DAYS_Y - 12);
-  gfx.print("DAYS TO RUN:");
+  gfx.print(_editDaysMask == 0 ? "DAYS TO RUN:   (none = run once, then done)"
+                               : "DAYS TO RUN:   (repeats weekly)");
   _drawDaysRow(ED_DAYS_Y, _editDaysMask);
 
   // Time row — start time (always shown; relevant when any day is selected)
@@ -614,21 +785,29 @@ void _handleEditTouch(int tx, int ty) {
   }
   // DELETE
   if (_inRect(tx, ty, 290, NAV_Y + 10, 130, 50)) {
-    if (runState.running) stopSchedule();
-    theSchedule.used = false;
-    theSchedule.stepCount = 0;
+    Job* j = _selectedJob();
+    if (j) {
+      if (jobIsRunning(*j)) stopJob();
+      jobInitDefaults(*j);          // frees the slot
+      storage::saveAllJobs();
+    }
+    _selectedJobIndex = -1;
     currentScreen = SCR_SCHEDULES;
     needsRedraw = true;
     return;
   }
   // RUN NOW
   if (_inRect(tx, ty, 600, NAV_Y + 10, 190, 50)) {
-    _saveEditState(); startSchedule(); currentScreen = SCR_HOME; needsRedraw = true; return;
+    _saveEditState();
+    Job* j = _selectedJob();
+    if (j) startJob(*j);
+    currentScreen = SCR_HOME; needsRedraw = true; return;
   }
 
   // Pagination (only valid when more than one page exists)
-  int totalPages = theSchedule.stepCount == 0 ? 1
-                 : (theSchedule.stepCount + ED_STEPS_MAX - 1) / ED_STEPS_MAX;
+  Job* jp = _selectedJob();
+  int steps = jp ? jp->stepCount : 0;
+  int totalPages = steps == 0 ? 1 : (steps + ED_STEPS_MAX - 1) / ED_STEPS_MAX;
   if (totalPages > 1) {
     if (_editStepsPage > 0 &&
         _inRect(tx, ty, SCR_W - 280, ED_STEPS_Y - 6, 60, 30)) {
@@ -771,13 +950,14 @@ void _handleZoneSettingsTouch(int tx, int ty) {
   }
 }
 
-// ── NEW SCHEDULE screen ───────────────────────────────────────────────────
-// Compose a simple schedule on-device:
-//   • Start time (HH:MM)              auto-run toggle
+// ── NEW JOB screen ────────────────────────────────────────────────────────
+// Compose a simple job on-device:
+//   • Start time (HH:MM)
 //   • One global duration per zone
 //   • 8 zone toggles (2 × 4 grid)
-// SAVE assembles `theSchedule` from the selected zones (in numeric order)
-// using `_newDuration` for every step.
+// Step 2 (SCR_NEW_DAYS) picks the days, which decides whether this becomes a
+// one-shot run command or a repeating schedule. SAVE allocates a NEW job from
+// the selected zones (in numeric order) using `_newDuration` for every step.
 
 #define NS_TIME_Y    (HDR_H + 10)
 #define NS_DUR_Y     (HDR_H + 75)
@@ -982,35 +1162,68 @@ void _handleNewDaysTouch(int tx, int ty) {
     currentScreen = SCR_NEW_SCHEDULE;
     needsRedraw = true; return;
   }
-  // SAVE — assemble theSchedule from the collected builder state
+  // SAVE — commit the builder state as a NEW job (existing jobs are untouched)
   if (_inRect(tx, ty, SCR_W - 200, NAV_Y + 10, 180, 50)) {
-    int n = 0;
-    for (int i = 0; i < ZONE_COUNT; i++) {
-      if (_newZones[i]) {
-        theSchedule.steps[n].zoneId   = i + 1;
-        theSchedule.steps[n].duration = _newDuration * 60;
-        n++;
-      }
-    }
-    if (n == 0) {
+    int selected = 0;
+    for (int i = 0; i < ZONE_COUNT; i++) if (_newZones[i]) selected++;
+    if (selected == 0) {
       // shouldn't happen — NEXT button is gated on n > 0, but be defensive
       currentScreen = SCR_NEW_SCHEDULE; needsRedraw = true; return;
     }
-    if (runState.running) stopSchedule();
-    theSchedule.used      = true;
-    theSchedule.id        = nextScheduleId++;
-    strncpy(theSchedule.name, "On-device", sizeof(theSchedule.name) - 1);
-    theSchedule.name[sizeof(theSchedule.name) - 1] = '\0';
-    theSchedule.stepCount = n;
-    theSchedule.runHour   = _newHour;
-    theSchedule.runMinute = _newMin;
-    theSchedule.daysMask  = _newDaysMask;
-    theSchedule.autoRun   = (_newDaysMask != 0);
-    // Mark this schedule as locally authored. EDIT screen surfaces this so
-    // the user knows the simple all-zones-same-duration shape is editable
-    // here, vs. server schedules which should be edited in the app.
-    strncpy(theSchedule.origin, "device", sizeof(theSchedule.origin) - 1);
-    theSchedule.origin[sizeof(theSchedule.origin) - 1] = '\0';
+
+    Job* j = allocJob();
+    if (!j) {
+      // All slots full. Say so rather than silently discarding the work.
+      gfx.fillRect(0, STS_Y, SCR_W, STS_H, C_BLACK);
+      gfx.setTextColor(C_RED); gfx.setTextSize(1);
+      gfx.setCursor(10, STS_Y + 14);
+      gfx.print("Job storage full - delete one first");
+      return;
+    }
+
+    jobInitDefaults(*j);
+    j->used      = true;
+    j->id        = nextJobId++;
+    j->enabled   = true;
+    j->runHour   = _newHour;
+    j->runMinute = _newMin;
+    j->daysMask  = _newDaysMask;
+
+    // No days picked means "run once". Give it a concrete fire time — the
+    // next occurrence of the chosen clock time — and let it retire afterwards.
+    if (_newDaysMask == 0) {
+      j->repeat     = REPEAT_NONE;
+      j->onComplete = ON_COMPLETE_DELETE;
+      if (ntpReady) {
+        uint32_t today = (ntpEpoch() / 86400UL) * 86400UL;
+        uint32_t fire  = today + (uint32_t)_newHour * 3600UL
+                               + (uint32_t)_newMin * 60UL;
+        if (fire <= (uint32_t)ntpEpoch()) fire += 86400UL;
+        j->runAtEpoch = fire;
+      }
+    } else {
+      j->repeat     = (_newDaysMask == 0x7F) ? REPEAT_DAILY : REPEAT_WEEKLY;
+      j->onComplete = ON_COMPLETE_KEEP;
+    }
+
+    int n = 0;
+    for (int i = 0; i < ZONE_COUNT && n < JOB_MAX_STEPS; i++) {
+      if (_newZones[i]) {
+        j->steps[n].zoneId   = i + 1;
+        j->steps[n].duration = _newDuration * 60;
+        n++;
+      }
+    }
+    j->stepCount = n;
+
+    snprintf(j->name, sizeof(j->name), "On-device %d", j->id);
+    // Mark this job as locally authored. The EDIT screen surfaces this so the
+    // user knows the simple all-zones-same-duration shape is editable here,
+    // vs. server jobs which should be edited in the app.
+    strncpy(j->origin, "device", sizeof(j->origin) - 1);
+    j->origin[sizeof(j->origin) - 1] = '\0';
+
+    storage::saveAllJobs();
     currentScreen = SCR_SCHEDULES;
     needsRedraw = true;
     return;

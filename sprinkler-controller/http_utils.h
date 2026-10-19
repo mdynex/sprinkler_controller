@@ -20,7 +20,18 @@ struct HttpRequest {
   String body;
   int    contentLength;
   String claimSecret;   // value of the X-Claim-Secret header, empty if absent
+  String deviceToken;   // value of the X-Device-Token header, empty if absent
 };
+
+// Compare two secrets in time that depends only on their lengths, so a LAN
+// caller can't recover a token byte by byte from response timing.
+bool secretsEqual(const char* a, const char* b) {
+  size_t la = strlen(a), lb = strlen(b);
+  unsigned char diff = (la == lb) ? 0 : 1;
+  size_t n = la < lb ? la : lb;
+  for (size_t i = 0; i < n; i++) diff |= (unsigned char)(a[i] ^ b[i]);
+  return diff == 0;
+}
 
 // Read a full HTTP request from the connected client.
 // Times out after 2 seconds to avoid hanging on slow or dropped connections.
@@ -30,10 +41,12 @@ HttpRequest readRequest(WiFiClient& client) {
 
   String line = "";
   bool firstLine = true;
-  unsigned long deadline = millis() + 2000;
+  // Use elapsed-time comparison (millis() - start), not an absolute deadline,
+  // so the loop still terminates correctly across the millis() rollover.
+  unsigned long start = millis();
 
-  while (client.connected() && millis() < deadline) {
-    if (!client.available()) continue;
+  while (client.connected() && millis() - start < 2000) {
+    if (!client.available()) { delay(1); continue; }  // yield to the mbed net thread
     char c = client.read();
 
     if (c == '\n') {
@@ -56,6 +69,10 @@ HttpRequest readRequest(WiFiClient& client) {
           String v = line.substring(line.indexOf(':') + 1);
           v.trim();
           req.claimSecret = v;
+        } else if (lower.startsWith("x-device-token:")) {
+          String v = line.substring(line.indexOf(':') + 1);
+          v.trim();
+          req.deviceToken = v;
         }
         // An empty line marks the end of headers
         if (line == "" || line == "\r") break;
@@ -68,30 +85,54 @@ HttpRequest readRequest(WiFiClient& client) {
 
   // Read the request body if Content-Length was set (POST/PUT with JSON)
   if (req.contentLength > 0) {
-    deadline = millis() + 1500;
-    while ((int)req.body.length() < req.contentLength && millis() < deadline) {
+    req.body.reserve(req.contentLength);   // one allocation instead of growing byte-by-byte
+    unsigned long bodyStart = millis();
+    while ((int)req.body.length() < req.contentLength && millis() - bodyStart < 1500) {
       if (client.available()) req.body += (char)client.read();
+      else                    delay(1);   // yield instead of busy-spinning
     }
   }
 
   return req;
 }
 
-// Send an HTTP/1.1 JSON response back to the client.
-void sendResponse(WiFiClient& client, int status, const String& body) {
-  const char* text = (status == 200) ? "OK" :
-                     (status == 201) ? "Created" :
-                     (status == 400) ? "Bad Request" :
-                     (status == 404) ? "Not Found" : "Internal Server Error";
+static const char* _statusText(int status) {
+  switch (status) {
+    case 200: return "OK";
+    case 201: return "Created";
+    case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 404: return "Not Found";
+    case 409: return "Conflict";
+    case 429: return "Too Many Requests";
+    case 503: return "Service Unavailable";
+    case 507: return "Insufficient Storage";
+    default:  return "Internal Server Error";
+  }
+}
 
+// Write just the response headers. Use this when the body is produced in
+// pieces (see the job list in api.h) so a large response never has to exist
+// as a single allocation. `contentLength` must be the exact total.
+void sendHeaders(WiFiClient& client, int status, int contentLength) {
   client.print("HTTP/1.1 ");
   client.print(status);
   client.print(" ");
-  client.println(text);
+  client.println(_statusText(status));
   client.println("Content-Type: application/json");
   client.print("Content-Length: ");
-  client.println(body.length());
+  client.println(contentLength);
   client.println("Connection: close");
   client.println();   // blank line separates headers from body
-  client.print(body);
+}
+
+// Send a response from a plain char buffer — no String, no heap traffic.
+void sendResponseRaw(WiFiClient& client, int status, const char* body, int len) {
+  sendHeaders(client, status, len);
+  client.write((const uint8_t*)body, len);
+}
+
+// Send an HTTP/1.1 JSON response back to the client.
+void sendResponse(WiFiClient& client, int status, const String& body) {
+  sendResponseRaw(client, status, body.c_str(), (int)body.length());
 }

@@ -13,7 +13,7 @@
 //   - QRCode              by Richard Moore
 //
 // Boot flow:
-//   1. displayInit / zonesInit / schedulesInit (always)
+//   1. displayInit / zonesInit / jobsInit, then reload saved jobs from flash
 //   2. WiFi: try stored creds → fall back to hardcoded ones in config.h
 //      → final fallback enters the on-screen setup wizard (step 7)
 //   3. NTP sync
@@ -29,15 +29,18 @@
 #include <WiFi.h>
 #include <WiFiUDP.h>
 #include <ArduinoJson.h>
+#include "hal/trng_api.h"   // STM32H7 hardware random number generator
 #include <Arduino_GigaDisplay_GFX.h>
 #include <Arduino_GigaDisplayTouch.h>
 #include "config.h"
+#include "watchdog.h"
 #include "state.h"
-#include "storage.h"
 #include "http_utils.h"
 #include "zones.h"
 #include "ntp.h"
-#include "schedules.h"
+#include "jobs.h"
+#include "storage.h"   // includes jobs.h — storage knows Job, never the reverse
+#include "missed.h"
 #include "display.h"
 #include "wifi_setup.h"
 #include "settings.h"
@@ -85,13 +88,38 @@ bool connectWifiWithTimeout(const char* ssid, const char* pw, unsigned long time
 
 // ── Claim secret ────────────────────────────────────────────────────────────
 
+// Fill `out` with `len` random bytes from the hardware TRNG. Falls back to
+// random() only if the board has no TRNG — the claim secret is what stops a
+// LAN neighbour from claiming the controller, so it must not come from a
+// guessable seed like millis() at boot.
+static void _randomBytes(uint8_t* out, size_t len) {
+#if DEVICE_TRNG
+  trng_t rng;
+  trng_init(&rng);
+  size_t got = 0;
+  while (got < len) {
+    size_t n = 0;
+    if (trng_get_bytes(&rng, out + got, len - got, &n) != 0) n = 0;
+    got += n;
+  }
+  trng_free(&rng);
+#else
+  randomSeed(analogRead(A0) ^ (uint32_t)micros());
+  for (size_t i = 0; i < len; i++) out[i] = (uint8_t)random(256);
+#endif
+}
+
 // Generate a 16-hex-character random secret in `claimSecret` and a
 // matching 6-digit decimal `claimCode` derived from the first 24 bits.
 // The secret authenticates the server when it later POSTs /provision.
 void generateClaimSecret() {
   static const char hex[] = "0123456789abcdef";
-  randomSeed(analogRead(A0) ^ (uint32_t)millis());
-  for (int i = 0; i < 16; i++) claimSecret[i] = hex[random(16)];
+  uint8_t rnd[8];
+  _randomBytes(rnd, sizeof(rnd));
+  for (int i = 0; i < 8; i++) {
+    claimSecret[2 * i]     = hex[rnd[i] >> 4];
+    claimSecret[2 * i + 1] = hex[rnd[i] & 0x0F];
+  }
   claimSecret[16] = '\0';
 
   uint32_t v = 0;
@@ -110,7 +138,16 @@ void setup() {
   delay(500);
   displayInit();
   zonesInit();
-  schedulesInit();
+  jobsInit();
+
+  // Jobs survive power cycles. Load them before anything can run, and give
+  // jobs.h a way to write back when the runner retires or disables one.
+  storage::loadAllJobs();
+  onJobPersistNeeded = []() { storage::saveAllJobs(); };
+  onJobMissed = [](const Job& j, uint32_t due) { missed::record(j, due, false); };
+  Serial.print("[boot] Loaded ");
+  Serial.print(jobCount());
+  Serial.println(" job(s) from flash");
 
   // 1. WiFi — try saved creds first
   char ssid[33] = "", pw[65] = "";
@@ -124,6 +161,11 @@ void setup() {
   }
 
   ntpInit();
+
+  // Work out what the device slept through while it was powered off. Needs a
+  // trustworthy clock, so it runs after NTP — and is retried from loop() if
+  // this first sync failed.
+  missed::scanAtBoot();
 
   // 2. Boot routing:
   //    - Server config present → STATE_RUNNING (paired)
@@ -145,9 +187,7 @@ void setup() {
     deviceState   = STATE_PAIRING;
     currentScreen = SCR_PAIRING;
     Serial.print("[boot] Unpaired — claim code: ");
-    Serial.print(claimCode);
-    Serial.print("  secret: ");
-    Serial.println(claimSecret);
+    Serial.println(claimCode);
   }
   needsRedraw = true;
 
@@ -155,18 +195,34 @@ void setup() {
   server.begin();
   Serial.print("API ready at http://");
   Serial.println(WiFi.localIP());
+
+  // 4. Arm the hardware watchdog. Done last, after all the long boot-time
+  //    blocking (WiFi connect, on-screen setup, NTP) so those don't trip it.
+  //    From here on, loop() must kick it within wdt::WATCHDOG_TIMEOUT_MS or
+  //    the board resets.
+  wdt::begin();
 }
 
 // ── Loop ────────────────────────────────────────────────────────────────────
 
 void loop() {
+  wdt::kick();          // feed the hardware watchdog — must happen every pass
+  heapLogTick();        // diagnostic: log free heap once a minute (see heartbeat.h)
+
   ntpUpdate();          // re-sync time once per hour
   wifi_setup::tick();   // performs the connect attempt after CONNECTING is drawn
 
+  missed::scanAtBoot();   // no-op once it has run; retries if NTP was late
+  missed::tick();         // refresh the liveness marker every few minutes
+
+  // Close valves on time in EVERY state, not just STATE_RUNNING: a job can
+  // still be running after Settings → Re-pair, or be started late by the
+  // missed-job scan on an unpaired boot, and nothing else would close it.
+  serviceValves();
+
   if (deviceState == STATE_RUNNING) {
-    heartbeatTick();    // send keepalive to server every 60s
-    scheduleTick();     // advance the active schedule
-    schedulerCheck();   // fire any auto-run schedule whose time matches now
+    heartbeatTick();      // send keepalive to server every 60s
+    jobSchedulerCheck();  // fire any job whose time has come
   }
   displayLoop();        // touch input + redraws
 
@@ -190,7 +246,10 @@ void loop() {
   WiFiClient client = server.available();
   if (client) {
     HttpRequest req = readRequest(client);
-    if (req.method.length() > 0) handleApi(client, req);
+    if (req.method.length() > 0) {
+      handleApi(client, req);
+      wifi_recovery::noteInboundRequest();   // served a request: the LAN works
+    }
     client.stop();
   }
 }
