@@ -246,7 +246,10 @@ void loop() {
   WiFiClient client = server.available();
   if (client) {
     HttpRequest req = readRequest(client);
-    if (req.method.length() > 0) handleApi(client, req);
+    if (req.method.length() > 0) {
+      handleApi(client, req);
+      wifi_recovery::noteInboundRequest();   // served a request: the LAN works
+    }
     client.stop();
   }
 }

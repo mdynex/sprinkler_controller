@@ -28,10 +28,22 @@
 //   2. >= HEARTBEAT_FAIL_THRESHOLD consecutive heartbeat failures —
 //      catches the wedged-stack case where status() lies.
 //
+// Trigger 2 can't tell a wedged radio from a server that is simply down or
+// unreachable. Treating every server outage as a radio fault dropped and
+// rejoined WiFi every ~3 minutes for as long as the outage lasted, and one of
+// those rejoins hung until the hardware watchdog reset the board. So:
+//   - any request the board serves (the server calling in) proves the LAN
+//     works and clears the heartbeat failure count;
+//   - when a heartbeat-triggered rejoin succeeds but heartbeats keep failing,
+//     the fault is upstream, so the next heartbeat-triggered rejoin waits
+//     HB_HOLD_INITIAL_MS, doubling each time up to HB_HOLD_MAX_MS. A
+//     successful heartbeat clears the hold. Trigger 1 is never held back.
+//
 // Public API
 // ----------
-//   noteHeartbeatSuccess() — heartbeat round-trip OK, reset counter
+//   noteHeartbeatSuccess() — heartbeat round-trip OK, reset counter + hold
 //   noteHeartbeatFailure() — heartbeat couldn't reach server
+//   noteInboundRequest()   — the board served an HTTP request (LAN is fine)
 //   tick()                 — drive the state machine; call from loop()
 //   exhausted()            — true when the silent tier has given up;
 //                            caller should now invoke wifi_setup::run()
@@ -46,18 +58,24 @@ namespace wifi_recovery {
   static const int           HEARTBEAT_FAIL_THRESHOLD     = 3;
   // Backoff between attempts. Length must be >= MAX_SILENT_ATTEMPTS - 1.
   static const unsigned long BACKOFF_MS[]                 = {10000UL, 30000UL, 60000UL};
+  // Hold-off for heartbeat-triggered rejoins once one didn't help.
+  static const unsigned long HB_HOLD_INITIAL_MS           = 15UL * 60UL * 1000UL;       // 15 min
+  static const unsigned long HB_HOLD_MAX_MS               = 6UL * 60UL * 60UL * 1000UL; // 6 h
 
   // ── Internal state ───────────────────────────────────────────────────────
   static int           _hbFailures     = 0;
   static int           _silentAttempts = 0;
-  static unsigned long _nextAttemptAt  = 0;
+  static unsigned long _waitStart      = 0;      // backoff timing, elapsed-style
+  static unsigned long _waitMs         = 0;      // so it survives millis() rollover
   static bool          _recovering     = false;
   static bool          _exhausted      = false;
+  static bool          _hbTriggered    = false;  // current cycle came from trigger 2
+  static unsigned long _hbHoldMs       = 0;      // 0 = no hold
+  static unsigned long _hbHoldStart    = 0;
 
-  // Heartbeat reports — kept inline so heartbeat.h can drop them on the
-  // fast path with no function-call overhead.
-  inline void noteHeartbeatSuccess() { _hbFailures = 0; }
-  inline void noteHeartbeatFailure() { _hbFailures++;   }
+  inline void noteHeartbeatSuccess() { _hbFailures = 0; _hbHoldMs = 0; }
+  inline void noteHeartbeatFailure() { _hbFailures++; }
+  inline void noteInboundRequest()   { _hbFailures = 0; }
 
   inline bool exhausted() { return _exhausted; }
 
@@ -66,9 +84,12 @@ namespace wifi_recovery {
   inline void reset() {
     _hbFailures     = 0;
     _silentAttempts = 0;
-    _nextAttemptAt  = 0;
+    _waitStart      = 0;
+    _waitMs         = 0;
     _recovering     = false;
     _exhausted      = false;
+    _hbTriggered    = false;
+    _hbHoldMs       = 0;
   }
 
   // Synchronous best-effort reconnect using the saved creds. Blocks for up
@@ -85,7 +106,7 @@ namespace wifi_recovery {
     Serial.print(_silentAttempts + 1);
     Serial.print("/");
     Serial.print(MAX_SILENT_ATTEMPTS);
-    Serial.print(" → ");
+    Serial.print(" -> ");
     Serial.println(ssid);
 
     // Tear the link down first. On the Murata module this is the only way
@@ -108,12 +129,17 @@ namespace wifi_recovery {
     return false;
   }
 
+  // True while a heartbeat-triggered rejoin is being held back.
+  inline bool _hbHeld() {
+    return _hbHoldMs != 0 && millis() - _hbHoldStart < _hbHoldMs;
+  }
+
   // True if recovery should kick in (or keep running).
   inline bool _shouldRecover() {
     if (wifi_setup::isActive())          return false;  // wizard owns the radio
     if (deviceState != STATE_RUNNING)    return false;  // pairing flow handles its own
     if (WiFi.status() != WL_CONNECTED)   return true;
-    if (_hbFailures >= HEARTBEAT_FAIL_THRESHOLD) return true;
+    if (_hbFailures >= HEARTBEAT_FAIL_THRESHOLD && !_hbHeld()) return true;
     return false;
   }
 
@@ -126,12 +152,13 @@ namespace wifi_recovery {
     if (!_recovering) {
       if (!_shouldRecover()) {
         _silentAttempts = 0;
-        _nextAttemptAt  = 0;
         return false;
       }
       _recovering     = true;
       _silentAttempts = 0;
-      _nextAttemptAt  = millis();          // first attempt fires immediately
+      _hbTriggered    = (WiFi.status() == WL_CONNECTED);
+      _waitStart      = millis();
+      _waitMs         = 0;                 // first attempt fires immediately
       Serial.print("[wifi-recovery] Triggered (hbFails=");
       Serial.print(_hbFailures);
       Serial.print(", status=");
@@ -139,13 +166,22 @@ namespace wifi_recovery {
       Serial.println(")");
     }
 
-    if (millis() < _nextAttemptAt) return true;  // sitting in backoff
+    if (millis() - _waitStart < _waitMs) return true;  // sitting in backoff
 
     if (_trySilentReconnect()) {
       _recovering     = false;
       _silentAttempts = 0;
       _hbFailures     = 0;
-      _nextAttemptAt  = 0;
+      if (_hbTriggered) {
+        // The radio rejoined fine, so if heartbeats keep failing the problem
+        // is the server or the path to it. Don't rejoin for that again soon.
+        _hbHoldMs    = _hbHoldMs ? _hbHoldMs * 2 : HB_HOLD_INITIAL_MS;
+        if (_hbHoldMs > HB_HOLD_MAX_MS) _hbHoldMs = HB_HOLD_MAX_MS;
+        _hbHoldStart = millis();
+        Serial.print("[wifi-recovery] Heartbeat-triggered rejoin done; next one held for ");
+        Serial.print(_hbHoldMs / 60000UL);
+        Serial.println(" min unless a heartbeat succeeds");
+      }
       return false;
     }
 
@@ -161,7 +197,8 @@ namespace wifi_recovery {
     int boIdx = _silentAttempts - 1;
     const int backoffLen = (int)(sizeof(BACKOFF_MS) / sizeof(BACKOFF_MS[0]));
     if (boIdx >= backoffLen) boIdx = backoffLen - 1;
-    _nextAttemptAt = millis() + BACKOFF_MS[boIdx];
+    _waitStart = millis();
+    _waitMs    = BACKOFF_MS[boIdx];
     Serial.print("[wifi-recovery] Next attempt in ");
     Serial.print(BACKOFF_MS[boIdx] / 1000UL);
     Serial.println("s");
