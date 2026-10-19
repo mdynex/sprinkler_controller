@@ -29,6 +29,7 @@
 #include <WiFi.h>
 #include <WiFiUDP.h>
 #include <ArduinoJson.h>
+#include "hal/trng_api.h"   // STM32H7 hardware random number generator
 #include <Arduino_GigaDisplay_GFX.h>
 #include <Arduino_GigaDisplayTouch.h>
 #include "config.h"
@@ -87,13 +88,38 @@ bool connectWifiWithTimeout(const char* ssid, const char* pw, unsigned long time
 
 // ── Claim secret ────────────────────────────────────────────────────────────
 
+// Fill `out` with `len` random bytes from the hardware TRNG. Falls back to
+// random() only if the board has no TRNG — the claim secret is what stops a
+// LAN neighbour from claiming the controller, so it must not come from a
+// guessable seed like millis() at boot.
+static void _randomBytes(uint8_t* out, size_t len) {
+#if DEVICE_TRNG
+  trng_t rng;
+  trng_init(&rng);
+  size_t got = 0;
+  while (got < len) {
+    size_t n = 0;
+    if (trng_get_bytes(&rng, out + got, len - got, &n) != 0) n = 0;
+    got += n;
+  }
+  trng_free(&rng);
+#else
+  randomSeed(analogRead(A0) ^ (uint32_t)micros());
+  for (size_t i = 0; i < len; i++) out[i] = (uint8_t)random(256);
+#endif
+}
+
 // Generate a 16-hex-character random secret in `claimSecret` and a
 // matching 6-digit decimal `claimCode` derived from the first 24 bits.
 // The secret authenticates the server when it later POSTs /provision.
 void generateClaimSecret() {
   static const char hex[] = "0123456789abcdef";
-  randomSeed(analogRead(A0) ^ (uint32_t)millis());
-  for (int i = 0; i < 16; i++) claimSecret[i] = hex[random(16)];
+  uint8_t rnd[8];
+  _randomBytes(rnd, sizeof(rnd));
+  for (int i = 0; i < 8; i++) {
+    claimSecret[2 * i]     = hex[rnd[i] >> 4];
+    claimSecret[2 * i + 1] = hex[rnd[i] & 0x0F];
+  }
   claimSecret[16] = '\0';
 
   uint32_t v = 0;
@@ -118,6 +144,7 @@ void setup() {
   // jobs.h a way to write back when the runner retires or disables one.
   storage::loadAllJobs();
   onJobPersistNeeded = []() { storage::saveAllJobs(); };
+  onJobMissed = [](const Job& j, uint32_t due) { missed::record(j, due, false); };
   Serial.print("[boot] Loaded ");
   Serial.print(jobCount());
   Serial.println(" job(s) from flash");
@@ -160,9 +187,7 @@ void setup() {
     deviceState   = STATE_PAIRING;
     currentScreen = SCR_PAIRING;
     Serial.print("[boot] Unpaired — claim code: ");
-    Serial.print(claimCode);
-    Serial.print("  secret: ");
-    Serial.println(claimSecret);
+    Serial.println(claimCode);
   }
   needsRedraw = true;
 

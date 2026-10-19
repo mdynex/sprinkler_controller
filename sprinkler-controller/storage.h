@@ -36,6 +36,7 @@ constexpr const char* K_SRV_DEVID    = "srv_devid";
 constexpr const char* K_SRV_TOKEN    = "srv_token";
 constexpr const char* K_PAIR_SKIPPED = "pair_skipped";   // "1" if user chose standalone mode
 constexpr const char* K_LAST_ALIVE   = "last_alive";
+constexpr const char* K_JOB_NEXT_ID  = "job_next";   // next job id to hand out
 
 // Read a null-terminated string. Returns false if the key is missing
 // or any read error occurs. `out` is set to "" on failure.
@@ -230,11 +231,18 @@ bool loadJob(int slot, Job& j) {
 }
 
 // Write every slot. Called after any mutation that could touch more than one.
+//
+// Also saves the id counter. Ids must never be reused: the server mirrors
+// jobs by device id, so a new job that inherited a deleted job's id after a
+// reboot would be matched to the wrong schedule.
 void saveAllJobs() {
   for (int i = 0; i < MAX_JOBS; i++) saveJob(i, jobs[i]);
+  int32_t next = nextJobId;
+  kv_set(K_JOB_NEXT_ID, &next, sizeof(next), 0);
 }
 
-// Repopulate `jobs[]` from flash and set nextJobId past the highest id seen.
+// Repopulate `jobs[]` from flash and restore nextJobId: the saved counter,
+// or past the highest id seen if that is larger (or nothing was saved yet).
 void loadAllJobs() {
   int highest = 0;
   for (int i = 0; i < MAX_JOBS; i++) {
@@ -245,6 +253,13 @@ void loadAllJobs() {
     }
   }
   nextJobId = highest + 1;
+
+  int32_t saved = 0;
+  size_t  actual = 0;
+  if (kv_get(K_JOB_NEXT_ID, &saved, sizeof(saved), &actual) == 0 &&
+      actual == sizeof(saved) && saved > nextJobId) {
+    nextJobId = saved;
+  }
 }
 
 // ── Liveness marker ────────────────────────────────────────────────────────

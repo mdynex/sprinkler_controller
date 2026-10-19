@@ -111,7 +111,8 @@ void heartbeatTick() {
   // Body carries the LAN address, plus any jobs the device slept through since
   // the last successful report. Built in a static buffer — this runs every
   // minute forever, so it must not churn the heap.
-  static char body[1024];
+  // 3 KB fits a full missed-job buffer (8 records with escaped names).
+  static char body[3072];
   int n = snprintf(body, sizeof(body), "{\"address\":\"%s:80\"", ip.c_str());
   int reported = missed::count();
   if (reported > 0 && (size_t)n < sizeof(body)) {

@@ -32,8 +32,9 @@
 // responsive while watering.
 //
 // Only ONE job runs at a time — zones are physically exclusive. A job that
-// comes due while another is running is left alone and retried on a later
-// tick; missed.h decides when a repeatedly-blocked job counts as missed.
+// comes due while another is running is queued and started when the zones
+// free up; if it waits too long it is reported as missed (see
+// jobSchedulerCheck()).
 // =============================================================================
 
 #define MAX_JOBS        8
@@ -88,6 +89,10 @@ struct Job {
   // fire; and a timed zone run that dies with a power cut is exactly the
   // outcome we want anyway (the relay de-energizes and the valve closes).
   bool     isTransient;
+  // RAM only, never persisted: when this recurring job came due while
+  // another job was running, the epoch it was due at; 0 when not queued.
+  // See jobSchedulerCheck().
+  uint32_t pendingSince;
 };
 
 // ── Global state ───────────────────────────────────────────────────────────
@@ -150,6 +155,7 @@ void jobInitDefaults(Job& j) {
   j.onComplete   = ON_COMPLETE_DELETE;   // one-shot default; overridden below
   j.lastRunEpoch = 0;
   j.isTransient  = false;
+  j.pendingSince = 0;
   strncpy(j.origin, "server", sizeof(j.origin) - 1);
   j.origin[sizeof(j.origin) - 1] = '\0';
 }
@@ -199,18 +205,44 @@ static uint8_t _onCompleteFromName(const char* s, uint8_t fallback) {
   return fallback;
 }
 
+// Copy `in` into `out` as the inside of a JSON string: quotes and
+// backslashes escaped, control characters as \u00XX. Names come from the
+// app and the server, and one stray quote used to make the whole GET /jobs
+// response unparseable. `out` needs up to 6 x strlen(in) + 1 bytes.
+void jsonEscape(const char* in, char* out, size_t outLen) {
+  static const char hex[] = "0123456789abcdef";
+  size_t o = 0;
+  for (; *in && o + 1 < outLen; in++) {
+    unsigned char c = (unsigned char)*in;
+    if (c == '"' || c == '\\') {
+      if (o + 2 >= outLen) break;
+      out[o++] = '\\'; out[o++] = (char)c;
+    } else if (c < 0x20) {
+      if (o + 6 >= outLen) break;
+      out[o++] = '\\'; out[o++] = 'u'; out[o++] = '0'; out[o++] = '0';
+      out[o++] = hex[c >> 4]; out[o++] = hex[c & 0x0F];
+    } else {
+      out[o++] = (char)c;
+    }
+  }
+  out[o] = '\0';
+}
+
 // Serialize one job into `buf`. Returns the number of chars written
 // (excluding the null), or 0 if the buffer was too small.
 //
 // `auto_run` is emitted for backwards compatibility with the Android app,
 // which predates the job model. It is derived, never stored.
 int jobToJson(const Job& j, char* buf, size_t bufLen) {
+  char name[sizeof(j.name) * 6], origin[sizeof(j.origin) * 6];
+  jsonEscape(j.name, name, sizeof(name));
+  jsonEscape(j.origin, origin, sizeof(origin));
   int n = snprintf(buf, bufLen,
     "{\"id\":%d,\"name\":\"%s\",\"origin\":\"%s\""
     ",\"enabled\":%s,\"repeat\":\"%s\",\"on_complete\":\"%s\""
     ",\"auto_run\":%s,\"run_time\":\"%02d:%02d\",\"run_at\":%lu"
     ",\"last_run\":%lu,\"running\":%s,\"transient\":%s,\"days\":[",
-    j.id, j.name, j.origin,
+    j.id, name, origin,
     j.enabled ? "true" : "false",
     _repeatName(j.repeat),
     _onCompleteName(j.onComplete),
@@ -467,50 +499,90 @@ static bool _recurringDueAt(const Job& j, int hour, int minute, int dow) {
   return ((j.daysMask >> dow) & 1) != 0;
 }
 
+// How long a recurring job that came due while another job was running may
+// wait in the queue. Watering an hour or two late is fine; after this it is
+// reported as missed (and stays armed for its next occurrence).
+constexpr uint32_t JOB_QUEUE_GRACE_SECONDS = 2UL * 60UL * 60UL;
+
+// Report hook for a queued job that waited too long. Injected by the .ino
+// (it points at missed::record) so this header doesn't depend on missed.h.
+void (*onJobMissed)(const Job& j, uint32_t scheduledEpoch) = nullptr;
+
 // Called every loop(). Checks every 30 s whether any job is due.
 //
-// Only one job can run at a time; if something is already running, a job that
-// comes due is simply left for the next check. Because the check runs every
-// 30 s and the due-window is a whole minute, it will be picked up as soon as
-// the zones free up — and if it stays blocked long enough, the boot-time
-// missed-job scan in missed.h will report it.
+// Only one job runs at a time. A recurring job matches on an exact
+// hour:minute, so if another job is running through that minute it would
+// simply never fire. Instead it is queued (pendingSince = the time it was
+// due) and started as soon as the zones are free — oldest first, alongside
+// any due one-shots. If it is still waiting after JOB_QUEUE_GRACE_SECONDS it
+// is reported through onJobMissed rather than dropped silently.
 void jobSchedulerCheck() {
-  if (!ntpReady)        return;
-  if (runState.running) return;
+  if (!ntpReady) return;
 
   static unsigned long lastCheck = 0;
   if (millis() - lastCheck < 30000UL) return;
   lastCheck = millis();
 
-  int           nowHour   = ntpHour();
-  int           nowMinute = ntpMinute();
-  int           dow       = ntpDayOfWeek();
-  unsigned long nowEpoch  = ntpEpoch();
+  int      nowHour    = ntpHour();
+  int      nowMinute  = ntpMinute();
+  int      dow        = ntpDayOfWeek();
+  uint32_t nowEpoch   = (uint32_t)ntpEpoch();
+  uint32_t occurrence = nowEpoch - (nowEpoch % 60UL);   // start of this minute
 
+  // 1. Queue recurring jobs whose time is now — even while busy, because the
+  //    match window is only this minute. lastRunEpoch >= occurrence means
+  //    this occurrence already ran (or is running), so it isn't queued twice.
+  for (int i = 0; i < MAX_JOBS; i++) {
+    Job& j = jobs[i];
+    if (!j.used || !j.enabled || j.pendingSince != 0) continue;
+    if (!_recurringDueAt(j, nowHour, nowMinute, dow)) continue;
+    if (j.lastRunEpoch >= occurrence) continue;
+    j.pendingSince = occurrence;
+    if (runState.running) {
+      Serial.print("[job] Due while busy, queued: "); Serial.println(j.name);
+    }
+  }
+
+  // 2. Give up on queued jobs that have waited too long.
+  for (int i = 0; i < MAX_JOBS; i++) {
+    Job& j = jobs[i];
+    if (!j.used || j.pendingSince == 0) continue;
+    if (!j.enabled) { j.pendingSince = 0; continue; }   // switched off while queued
+    if (nowEpoch - j.pendingSince <= JOB_QUEUE_GRACE_SECONDS) continue;
+    Serial.print("[job] Waited too long, missed: "); Serial.println(j.name);
+    if (onJobMissed) onJobMissed(j, j.pendingSince);
+    j.pendingSince = 0;
+  }
+
+  if (runState.running) return;
+
+  // 3. Start the job that has been due the longest: a queued recurring job
+  //    (keyed by when it came due) or a one-shot (keyed by its run_at).
+  Job*     pick    = nullptr;
+  uint32_t pickKey = 0;
   for (int i = 0; i < MAX_JOBS; i++) {
     Job& j = jobs[i];
     if (!j.used || !j.enabled) continue;
-
-    bool due = false;
+    uint32_t key = 0;
     if (j.repeat == REPEAT_NONE) {
-      due = (j.runAtEpoch > 0 && nowEpoch >= j.runAtEpoch);
+      if (j.runAtEpoch == 0 || nowEpoch < j.runAtEpoch) continue;
+      key = j.runAtEpoch;
     } else {
-      // The 23-hour guard stops a job re-firing within the same minute window.
-      due = _recurringDueAt(j, nowHour, nowMinute, dow) &&
-            (nowEpoch - j.lastRunEpoch >= 23 * 3600UL);
+      if (j.pendingSince == 0) continue;
+      key = j.pendingSince;
     }
-    if (!due) continue;
+    if (!pick || key < pickKey) { pick = &j; pickKey = key; }
+  }
+  if (!pick) return;
 
-    Serial.print("[job] Auto-starting: "); Serial.println(j.name);
-    if (startJob(j)) {
-      j.lastRunEpoch = nowEpoch;
-      return;   // one at a time
-    }
+  Job& j = *pick;
+  j.pendingSince = 0;
+  Serial.print("[job] Auto-starting: "); Serial.println(j.name);
+  j.lastRunEpoch = nowEpoch;
+  if (!startJob(j)) {
     // Nothing runnable (all zones disabled) — treat it as having run so a
     // one-shot still retires instead of retrying forever.
-    j.lastRunEpoch = nowEpoch;
     _finishJob(j);
-    return;
   }
 }
 

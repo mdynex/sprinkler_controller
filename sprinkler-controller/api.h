@@ -17,6 +17,9 @@ void routeProvision(WiFiClient& client, HttpRequest& req);  // defined in pairin
 // All incoming HTTP requests are dispatched here by handleApi(). Each route is
 // matched by HTTP method + URL path. Responses are always JSON.
 //
+// Auth: once paired, every route except POST /provision requires the header
+// X-Device-Token: <the token from /provision>. Missing or wrong → 401.
+//
 //   GET  /time                   → current synced time and epoch
 //   GET  /zones                  → list all zones and their on/off state
 //   POST /zones/{id}/on|off      → turn zone {id} on/off  (id = 1–8)
@@ -56,7 +59,11 @@ void routeProvision(WiFiClient& client, HttpRequest& req);  // defined in pairin
 
 // Scratch buffer for serializing one job. Static so a large response never
 // touches the heap — this board has a known fragmentation sensitivity.
-static char _jobBuf[2048];
+// 4 KB holds the largest possible job (64 steps of 10-digit durations plus a
+// fully escaped name) with room to spare. At 2 KB a big cycle-and-soak job
+// failed to encode and silently dropped out of GET /jobs, which the server
+// then read as "deleted on the device".
+static char _jobBuf[4096];
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -249,6 +256,16 @@ void handleApi(WiFiClient& client, HttpRequest& req) {
   // Block all other routes until the device is paired with a server.
   if (deviceState != STATE_RUNNING) {
     sendResponse(client, 503, "{\"error\":\"device unpaired\"}");
+    return;
+  }
+
+  // Once paired, every call must carry this device's token (T12). The server
+  // minted it and sent it in /provision, so only the server — not any other
+  // LAN client — can drive the valves. Standalone mode (pairing skipped) has
+  // no token and stays open; nothing but the touchscreen controls it there.
+  if (deviceToken[0] != '\0' &&
+      !secretsEqual(req.deviceToken.c_str(), deviceToken)) {
+    sendResponse(client, 401, "{\"error\":\"missing or invalid X-Device-Token\"}");
     return;
   }
 

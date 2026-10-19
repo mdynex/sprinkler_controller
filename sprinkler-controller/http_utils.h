@@ -20,7 +20,18 @@ struct HttpRequest {
   String body;
   int    contentLength;
   String claimSecret;   // value of the X-Claim-Secret header, empty if absent
+  String deviceToken;   // value of the X-Device-Token header, empty if absent
 };
+
+// Compare two secrets in time that depends only on their lengths, so a LAN
+// caller can't recover a token byte by byte from response timing.
+bool secretsEqual(const char* a, const char* b) {
+  size_t la = strlen(a), lb = strlen(b);
+  unsigned char diff = (la == lb) ? 0 : 1;
+  size_t n = la < lb ? la : lb;
+  for (size_t i = 0; i < n; i++) diff |= (unsigned char)(a[i] ^ b[i]);
+  return diff == 0;
+}
 
 // Read a full HTTP request from the connected client.
 // Times out after 2 seconds to avoid hanging on slow or dropped connections.
@@ -58,6 +69,10 @@ HttpRequest readRequest(WiFiClient& client) {
           String v = line.substring(line.indexOf(':') + 1);
           v.trim();
           req.claimSecret = v;
+        } else if (lower.startsWith("x-device-token:")) {
+          String v = line.substring(line.indexOf(':') + 1);
+          v.trim();
+          req.deviceToken = v;
         }
         // An empty line marks the end of headers
         if (line == "" || line == "\r") break;
@@ -86,8 +101,10 @@ static const char* _statusText(int status) {
     case 200: return "OK";
     case 201: return "Created";
     case 400: return "Bad Request";
+    case 401: return "Unauthorized";
     case 404: return "Not Found";
     case 409: return "Conflict";
+    case 429: return "Too Many Requests";
     case 503: return "Service Unavailable";
     case 507: return "Insufficient Storage";
     default:  return "Internal Server Error";

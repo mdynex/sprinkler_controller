@@ -66,7 +66,9 @@ int count() { return recordCount; }
 
 void clear() { recordCount = 0; }
 
-static void _record(const Job& j, uint32_t scheduledEpoch, bool deleted) {
+// Buffer one missed-job report for the next heartbeat. Also used by
+// jobs.h (via onJobMissed) for a queued job that waited too long.
+void record(const Job& j, uint32_t scheduledEpoch, bool deleted) {
   if (recordCount >= MAX_MISSED) return;   // oldest wins; a flood is still one alert
   MissedRecord& r = records[recordCount++];
   r.jobId          = j.id;
@@ -82,10 +84,12 @@ int toJson(char* buf, size_t bufLen) {
   int n = snprintf(buf, bufLen, "[");
   if (n < 0 || (size_t)n >= bufLen) return 0;
   for (int i = 0; i < recordCount; i++) {
+    char name[sizeof(records[i].name) * 6];
+    jsonEscape(records[i].name, name, sizeof(name));
     int w = snprintf(buf + n, bufLen - n,
       "%s{\"job_id\":%d,\"name\":\"%s\",\"scheduled_at\":%lu,\"deleted\":%s}",
       i ? "," : "",
-      records[i].jobId, records[i].name,
+      records[i].jobId, name,
       (unsigned long)records[i].scheduledEpoch,
       records[i].deleted ? "true" : "false");
     if (w < 0 || (size_t)(n + w) >= bufLen) return 0;
@@ -141,7 +145,7 @@ static bool _handleMissed(Job& j, uint32_t fireEpoch, uint32_t now, bool& ranLat
   bool deleted = (j.repeat == REPEAT_NONE);
   Serial.print("[missed] "); Serial.print(j.name);
   Serial.println(deleted ? " missed - deleting (one-shot)" : " missed - still armed");
-  _record(j, fireEpoch, deleted);
+  record(j, fireEpoch, deleted);
   if (deleted) jobInitDefaults(j);
   return deleted;
 }
